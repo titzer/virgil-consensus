@@ -1,0 +1,348 @@
+// A deterministic, randomized network/node simulator for Paxos.
+// Messages are held "in flight" and each round a random subset is delivered,
+// possibly dropped or duplicated. Nodes may crash and restart.
+
+// A small deterministic pseudo-random number generator (xorshift64*).
+class Rng {
+	var state: u64;
+
+	new(seed: u64) {
+		state = seed * 0x9E3779B97F4A7C15uL + 0x2545F4914F6CDD1DuL;
+		if (state == 0) state = 1;
+	}
+	def next() -> u64 {
+		var x = state;
+		x ^= x >> 12;
+		x ^= x << 25;
+		x ^= x >> 27;
+		state = x;
+		return x * 0x2545F4914F6CDD1DuL;
+	}
+	// Returns a number in [0, max).
+	def range(max: int) -> int {
+		if (max <= 1) return 0;
+		return int.view((next() >> 33) % u64.view(max));
+	}
+	// Returns a number in [min, max].
+	def between(min: int, max: int) -> int {
+		return min + range(max - min + 1);
+	}
+	// Returns true with probability {percent}/100.
+	def chance(percent: int) -> bool {
+		return range(100) < percent;
+	}
+}
+
+// A message in flight from {src} to {dst}.
+type Packet(src: int, dst: int, msg: Msg) #unboxed { }
+
+// Fault-injection parameters, all as percentages per round (or per message).
+class SimFaults {
+	var deliverPct = 50;	// chance each in-flight message is delivered this round
+	var dropPct = 0;	// chance a delivered message is lost instead
+	var dupPct = 0;		// chance a delivered message also stays in flight
+	var crashPct = 0;	// chance each up node crashes this round
+	var restartPct = 0;	// chance each down node restarts this round
+	var maxInFlight = 2000;	// excess messages are dropped (bounds duplication blowup)
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		return buf.put3("deliver=%d%% drop=%d%% dup=%d%% ", deliverPct, dropPct, dupPct)
+			.put2("crash=%d%% restart=%d%%", crashPct, restartPct);
+	}
+}
+
+// Global oracle: tracks every acceptance, computes which values are truly
+// chosen, and checks the Paxos safety properties.
+class SafetyChecker extends PaxosObserver {
+	def n: int;
+	def proposed = Vector<int>.new();
+	def ballots = HashMap<int, BallotRecord>.new(hashInt, int.==);
+	var chosen: int;		// the chosen value, 0 if none yet
+	var chosenRound = -1;
+	var violation: string;		// first safety violation found, null if none
+	var sim: Sim;
+
+	new(n) { }
+
+	def onAccepted(node: int, ballot: int, value: int) {
+		var rec = ballots[ballot];
+		if (rec == null) ballots[ballot] = rec = BallotRecord.new(value, Array<bool>.new(n));
+		if (rec.value != value) {
+			fail(StringBuilder.new().put3("ballot %d accepted two values: %d and %d", ballot, rec.value, value));
+		}
+		if (!isProposed(value)) {
+			fail(StringBuilder.new().put2("node %d accepted unproposed value %d", node, value));
+		}
+		if (rec.acceptors[node]) return;
+		rec.acceptors[node] = true;
+		if (++rec.count == n / 2 + 1) {
+			if (chosen == 0) {
+				chosen = value;
+				chosenRound = if(sim != null, sim.round);
+				if (sim != null) sim.listener.onChosen(sim, value, ballot);
+			} else if (chosen != value) {
+				fail(StringBuilder.new().put3("two values chosen: %d and %d (ballot %d)", chosen, value, ballot));
+			}
+		}
+	}
+	def onLearned(node: int, value: int) {
+		if (chosen == 0) {
+			fail(StringBuilder.new().put2("node %d learned %d before anything was chosen", node, value));
+		} else if (value != chosen) {
+			fail(StringBuilder.new().put3("node %d learned %d but %d was chosen", node, value, chosen));
+		}
+		if (sim != null) sim.listener.onLearned(sim, node, value);
+	}
+	def isProposed(value: int) -> bool {
+		for (i < proposed.length) if (proposed[i] == value) return true;
+		return false;
+	}
+	def fail(buf: StringBuilder) {
+		var msg = buf.toString();
+		if (violation == null) violation = msg;
+		if (sim != null) sim.listener.onViolation(sim, msg);
+	}
+}
+
+class BallotRecord(value: int, acceptors: Array<bool>) {
+	var count: int;
+}
+
+class Sim {
+	def n: int;
+	var rng: Rng;
+	def faults = SimFaults.new();
+	def config = PaxosConfig.new();
+	var checker: SafetyChecker;
+	var nodes: Array<PaxosNode>;
+	var up: Array<bool>;
+	var nextTimeout: Array<int>;
+	var inFlight = Vector<Packet>.new();
+	var round: int;
+	var listener = SimListener.new();	// observes simulation events, e.g. for printing
+	var timeoutMin = 8;		// retry timer range, in rounds
+	var timeoutMax = 24;
+	var autoTimeouts = true;	// fire node retry timers automatically
+
+	// Statistics.
+	var delivered: int;
+	var dropped: int;
+	var duplicated: int;
+	var crashes: int;
+
+	new(n, seed: u64) {
+		rng = Rng.new(seed);
+		checker = SafetyChecker.new(n);
+		checker.sim = this;
+		nodes = Array.new(n);
+		up = Array.new(n);
+		nextTimeout = Array.new(n);
+		for (i < n) {
+			nodes[i] = PaxosNode.new(i, n, config, checker);
+			up[i] = true;
+			nextTimeout[i] = rng.between(1, timeoutMax);
+		}
+	}
+
+	// Registers a proposal for node {i}; it will start a ballot when its timer fires.
+	def propose(i: int, value: int) -> this {
+		nodes[i].propose(value);
+		checker.proposed.put(value);
+	}
+	// Immediately fires node {i}'s timer (start a ballot, or query).
+	def kick(i: int) -> this {
+		if (!up[i]) return;
+		listener.onTimeout(this, i);
+		nodes[i].onTimeout();
+		collect(i);
+	}
+	def crash(i: int) -> this {
+		if (!up[i]) return;
+		up[i] = false;
+		crashes++;
+		listener.onCrash(this, i);
+	}
+	def restart(i: int) -> this {
+		if (up[i]) return;
+		up[i] = true;
+		nodes[i].crashAndRestart();
+		nextTimeout[i] = round + rng.between(timeoutMin, timeoutMax);
+		listener.onRestart(this, i);
+	}
+	def restartAll() -> this {
+		for (i < n) restart(i);
+	}
+	// Runs one simulation round: faults, timers, then message delivery.
+	def step() -> this {
+		round++;
+		// Crash and restart nodes.
+		for (i < n) {
+			if (up[i]) {
+				if (faults.crashPct > 0 && rng.chance(faults.crashPct)) crash(i);
+			} else {
+				if (faults.restartPct > 0 && rng.chance(faults.restartPct)) restart(i);
+			}
+		}
+		// Fire retry timers.
+		if (autoTimeouts) {
+			for (i < n) {
+				if (up[i] && round >= nextTimeout[i]) {
+					nextTimeout[i] = round + rng.between(timeoutMin, timeoutMax);
+					if (nodes[i].decided == 0) kick(i);
+				}
+			}
+		}
+		// Choose a random subset of in-flight messages to deliver.
+		var batch = Vector<Packet>.new(), keep = Vector<Packet>.new();
+		for (i < inFlight.length) {
+			var p = inFlight[i];
+			if (rng.chance(faults.deliverPct)) batch.put(p);
+			else keep.put(p);
+		}
+		inFlight = keep;
+		deliverBatch(batch);
+		listener.onQuiet(this);
+	}
+	// Delivers every in-flight message for which {pred} returns true (no faults).
+	def deliverIf(pred: Packet -> bool) -> this {
+		var batch = Vector<Packet>.new(), keep = Vector<Packet>.new();
+		for (i < inFlight.length) {
+			var p = inFlight[i];
+			if (pred(p)) batch.put(p);
+			else keep.put(p);
+		}
+		inFlight = keep;
+		for (i < batch.length) deliver(batch[i]);
+		listener.onQuiet(this);
+	}
+	// Delivers all in-flight messages, including those generated in response, until quiescent.
+	def deliverAll() -> this {
+		while (inFlight.length > 0) deliverIf(all);
+	}
+	// Drops every in-flight message for which {pred} returns true.
+	def dropIf(pred: Packet -> bool) -> this {
+		var keep = Vector<Packet>.new();
+		for (i < inFlight.length) {
+			var p = inFlight[i];
+			if (pred(p)) {
+				dropped++;
+				listener.onDrop(this, p);
+			} else {
+				keep.put(p);
+			}
+		}
+		inFlight = keep;
+		listener.onQuiet(this);
+	}
+	def allDecided() -> bool {
+		for (i < n) if (nodes[i].decided == 0) return false;
+		return true;
+	}
+	def numDecided() -> int {
+		var count = 0;
+		for (i < n) if (nodes[i].decided != 0) count++;
+		return count;
+	}
+	// Reports a free-form annotation to the listener.
+	def note(msg: string) {
+		listener.onNote(this, msg);
+	}
+
+	private def deliverBatch(batch: Vector<Packet>) {
+		// Deliver in a random order (Fisher-Yates shuffle).
+		var a = batch.array;
+		for (i = batch.length - 1; i > 0; i--) {
+			var j = rng.range(i + 1);
+			var t = a[i];
+			a[i] = a[j];
+			a[j] = t;
+		}
+		for (i < batch.length) {
+			var p = a[i];
+			if (faults.dropPct > 0 && rng.chance(faults.dropPct)) {
+				dropped++;
+				listener.onDrop(this, p);
+				continue;
+			}
+			if (faults.dupPct > 0 && rng.chance(faults.dupPct)) {
+				duplicated++;
+				inFlight.put(p);
+			}
+			deliver(p);
+		}
+		// Bound the number of in-flight messages by dropping random ones.
+		while (inFlight.length > faults.maxInFlight) {
+			var j = rng.range(inFlight.length);
+			var p = inFlight[j];
+			inFlight[j] = inFlight[inFlight.length - 1];
+			inFlight.resize(inFlight.length - 1);
+			dropped++;
+			listener.onDrop(this, p);
+		}
+	}
+	private def deliver(p: Packet) {
+		if (!up[p.dst]) {
+			dropped++;
+			listener.onDrop(this, p);
+			return;
+		}
+		delivered++;
+		listener.onDeliver(this, p);
+		nodes[p.dst].receive(p.src, p.msg);
+		collect(p.dst);
+	}
+	private def collect(i: int) {
+		var out = nodes[i].outbox;
+		for (j < out.length) {
+			var o = out[j];
+			inFlight.put(Packet(i, o.dst, o.msg));
+		}
+		out.clear();
+	}
+}
+
+// Receives notifications of simulation events. The default ignores them all.
+class SimListener {
+	def onTimeout(sim: Sim, node: int) { }
+	def onCrash(sim: Sim, node: int) { }
+	def onRestart(sim: Sim, node: int) { }
+	def onDeliver(sim: Sim, p: Packet) { }
+	def onDrop(sim: Sim, p: Packet) { }
+	def onChosen(sim: Sim, value: int, ballot: int) { }
+	def onLearned(sim: Sim, node: int, value: int) { }
+	def onViolation(sim: Sim, msg: string) { }
+	def onNote(sim: Sim, msg: string) { }
+	// Called after a batch of deliveries, when no more events are immediately pending.
+	def onQuiet(sim: Sim) { }
+}
+
+// Prints every event as a line of text.
+class TextLog extends SimListener {
+	def onTimeout(sim: Sim, node: int) { line(sim, StringBuilder.new().put1("node %d timeout", node)); }
+	def onCrash(sim: Sim, node: int) { line(sim, StringBuilder.new().put1("node %d CRASH", node)); }
+	def onRestart(sim: Sim, node: int) { line(sim, StringBuilder.new().put1("node %d RESTART", node)); }
+	def onDeliver(sim: Sim, p: Packet) { line(sim, renderPacket(StringBuilder.new(), p)); }
+	def onDrop(sim: Sim, p: Packet) { line(sim, renderPacket(StringBuilder.new().puts("drop "), p)); }
+	def onChosen(sim: Sim, value: int, ballot: int) {
+		line(sim, StringBuilder.new().put2("** value %d chosen in ballot %d", value, ballot));
+	}
+	def onLearned(sim: Sim, node: int, value: int) { line(sim, StringBuilder.new().put2("node %d learned %d", node, value)); }
+	def onViolation(sim: Sim, msg: string) { line(sim, StringBuilder.new().puts("!! SAFETY VIOLATION: ").puts(msg)); }
+	def onNote(sim: Sim, msg: string) { line(sim, StringBuilder.new().puts(msg)); }
+
+	def line(sim: Sim, buf: StringBuilder) {
+		System.puts(StringBuilder.new().put1("[%d] ", sim.round).puts(buf.toString()).ln().toString());
+	}
+}
+
+def renderPacket(buf: StringBuilder, p: Packet) -> StringBuilder {
+	buf.put2("%d -> %d: ", p.src, p.dst);
+	return p.msg.render(buf);
+}
+
+def all(p: Packet) -> bool {
+	return true;
+}
+def hashInt(i: int) -> int {
+	return i;
+}

@@ -1,0 +1,247 @@
+// Hand-written Paxos scenarios, each checking a specific behavior.
+// Usage: Scenarios [-v | -trace] [name-filter]
+//   -v       print a message sequence diagram of each scenario
+//   -trace   print a raw event log of each scenario
+//   Only scenarios whose name contains {name-filter} are run.
+
+var verbose = false;	// print a message sequence diagram
+var trace = false;	// print a raw event log
+var filter: string;
+var failures = 0;
+
+def main(args: Array<string>) -> int {
+	for (a in args) {
+		if (Strings.equal(a, "-v")) verbose = true;
+		else if (Strings.equal(a, "-trace")) trace = verbose = true;
+		else filter = a;
+	}
+	run("happy path", happyPath);
+	run("minority accept is adopted", minorityAcceptAdopted);
+	run("chosen value survives preemption", chosenSurvivesPreemption);
+	run("BUG(no adopt): preemption violates safety", buggyPreemptionDetected);
+	run("minority crash", minorityCrash);
+	run("majority crash blocks, then recovers", majorityCrash);
+	run("restarted acceptor keeps its promise", acceptorKeepsPromise);
+	run("dueling proposers converge", duelingProposers);
+	run("lossy, duplicating, reordering network", lossyNetwork);
+	run("crashing nodes and lossy network", crashyNetwork);
+	System.puts(if(failures == 0, "all scenarios passed\n", "SOME SCENARIOS FAILED\n"));
+	return failures;
+}
+
+def run(name: string, f: () -> string) {
+	if (filter != null && !contains(name, filter)) return;
+	System.puts("scenario: ");
+	System.puts(name);
+	System.puts(if(verbose, "\n", " ... "));
+	var err = f();
+	if (err == null) {
+		System.puts("PASS\n");
+	} else {
+		System.puts("FAIL: ");
+		System.puts(err);
+		System.ln();
+		failures++;
+	}
+}
+
+def newSim(n: int, seed: u64) -> Sim {
+	var sim = Sim.new(n, seed);
+	sim.listener = newListener();
+	sim.autoTimeouts = false;
+	return sim;
+}
+
+// Checks that there was no safety violation and all nodes in [0, count) learned {value}.
+def expectDecided(sim: Sim, count: int, value: int) -> string {
+	if (sim.checker.violation != null) return sim.checker.violation;
+	for (i < count) {
+		var d = sim.nodes[i].decided;
+		if (d != value) return StringBuilder.new().put3("node %d decided %d, expected %d", i, d, value).toString();
+	}
+	return null;
+}
+
+// Message selection predicates, used with partial application.
+def to(dst: int, p: Packet) -> bool {
+	return p.dst == dst;
+}
+def toAny(dsts: Array<int>, p: Packet) -> bool {
+	for (d in dsts) if (p.dst == d) return true;
+	return false;
+}
+def from(src: int, p: Packet) -> bool {
+	return p.src == src;
+}
+def prepareTo(dst: int, p: Packet) -> bool {
+	return p.dst == dst && Msg.Prepare.?(p.msg);
+}
+def isAccept(p: Packet) -> bool {
+	return Msg.Accept.?(p.msg);
+}
+
+// One proposer, perfect network.
+def happyPath() -> string {
+	var sim = newSim(3, 1);
+	sim.propose(0, 10).kick(0).deliverAll();
+	return expectDecided(sim, 3, 10);
+}
+
+// Node 0's value is accepted only by node 2 (not chosen) before node 0's
+// other messages are lost. Node 4 then runs a ballot with a quorum that
+// includes node 2, so it must adopt node 0's value rather than its own.
+def minorityAcceptAdopted() -> string {
+	var sim = newSim(5, 2);
+	sim.propose(0, 10).propose(4, 20);
+	sim.kick(0);					// Prepare(5) -> all
+	sim.deliverIf(toAny([0, 1, 2], _));		// Prepares to 0,1,2; Promises queued
+	sim.deliverIf(to(0, _));			// Promises -> 0; Accept(5, 10) -> all
+	sim.deliverIf(to(2, _));			// only acceptor 2 accepts
+	sim.dropIf(from(0, _));				// all of node 0's other messages are lost
+	if (sim.checker.chosen != 0) return "value chosen too early";
+	sim.kick(4);					// Prepare(9) -> all
+	sim.dropIf(toAny([0, 1], _));			// quorum is {2, 3, 4}
+	sim.deliverAll();
+	return expectDecided(sim, 5, 10);
+}
+
+// Node 0's value is chosen (accepted by a majority), but no learner hears
+// about it. A higher ballot from node 4 must re-propose the same value.
+def chosenSurvivesPreemption() -> string {
+	return preemption(PaxosConfig.new());
+}
+// Same scenario, with a protocol bug: the proposer ignores previously accepted
+// values. The checker must detect two different chosen values.
+def buggyPreemptionDetected() -> string {
+	var config = PaxosConfig.new();
+	config.adoptAccepted = false;
+	var err = preemption(config);
+	if (err == null) return "bug was not detected";
+	if (verbose) System.puts(StringBuilder.new().puts("  (detected: ").puts(err).puts(")\n").toString());
+	return null;
+}
+def preemption(config: PaxosConfig) -> string {
+	var sim = newSim(5, 3);
+	sim.config.adoptAccepted = config.adoptAccepted;
+	sim.propose(0, 10).propose(4, 20);
+	sim.kick(0);
+	sim.deliverIf(toAny([0, 1, 2], _));
+	sim.deliverIf(to(0, _));
+	sim.deliverIf(isAccept);			// Accepts reach 0,1,2 (Prepares to 3,4 still in flight)
+	sim.dropIf(from(0, _));				// all other node 0 messages lost
+	sim.dropIf(from(1, _));
+	sim.dropIf(from(2, _));				// all Accepted notifications lost
+	if (sim.checker.chosen != 10) return "value 10 should be chosen";
+	if (sim.numDecided() != 0) return "nobody should have learned yet";
+	sim.kick(4);
+	sim.dropIf(toAny([0, 1], _));			// quorum is {2, 3, 4}
+	sim.deliverAll();
+	return expectDecided(sim, 5, 10);
+}
+
+// Two of five nodes are down; the remaining majority decides.
+// The crashed nodes learn the outcome after restarting.
+def minorityCrash() -> string {
+	var sim = newSim(5, 4);
+	sim.crash(3).crash(4);
+	sim.propose(0, 10).kick(0).deliverAll();
+	var err = expectDecided(sim, 3, 10);
+	if (err != null) return err;
+	if (sim.numDecided() != 3) return "crashed nodes should not have decided";
+	sim.restart(3).restart(4).kick(3).kick(4).deliverAll();
+	return expectDecided(sim, 5, 10);
+}
+
+// Two of three nodes are down: no progress is possible. After they restart, a retry succeeds.
+def majorityCrash() -> string {
+	var sim = newSim(3, 5);
+	sim.crash(1).crash(2);
+	sim.propose(0, 10).kick(0).deliverAll();
+	if (sim.checker.chosen != 0 || sim.numDecided() != 0) return "decided without a majority";
+	sim.restart(1).restart(2).kick(0).deliverAll();
+	return expectDecided(sim, 3, 10);
+}
+
+// Node 1 promises a higher ballot to node 2, crashes, and restarts. Node 0's older
+// Accept(3) must still be rejected by node 1.
+def acceptorKeepsPromise() -> string {
+	var sim = newSim(3, 6);
+	sim.propose(0, 10).propose(2, 20);
+	sim.kick(0);					// Prepare(3)
+	sim.deliverIf(from(0, _));			// all promise 3
+	sim.deliverIf(to(0, _));			// Promises -> 0; Accept(3, 10) -> all
+	sim.dropIf(toAny([0, 2], _));			// only Accept -> 1 remains
+	sim.kick(2);					// Prepare(8), since node 2 saw ballot 3
+	sim.deliverIf(prepareTo(1, _));
+	sim.crash(1).restart(1);
+	if (sim.nodes[1].stable.promised != 8) return "promise lost across restart";
+	sim.deliverIf(isAccept);			// Accept(3, 10) -> 1
+	if (sim.nodes[1].stable.acceptedBallot != 0) return "accepted a ballot below its promise";
+	sim.deliverAll();
+	return expectDecided(sim, 3, 20);
+}
+
+// All five nodes propose at once with randomized retry timers; one value wins.
+def duelingProposers() -> string {
+	var sim = Sim.new(5, 7);
+	sim.listener = newListener();
+	sim.faults.deliverPct = 100;
+	for (i < 5) sim.propose(i, 10 * (i + 1));
+	return runUntilDecided(sim, 1000);
+}
+
+def lossyNetwork() -> string {
+	for (seed = 100uL; seed < 110uL; seed++) {
+		var sim = Sim.new(5, seed);
+		sim.listener = newListener();
+		sim.faults.deliverPct = 40;
+		sim.faults.dropPct = 30;
+		sim.faults.dupPct = 20;
+		for (i < 3) sim.propose(i, 10 * (i + 1));
+		var err = runUntilDecided(sim, 5000);
+		if (err != null) return err;
+	}
+	return null;
+}
+
+def crashyNetwork() -> string {
+	for (seed = 200uL; seed < 210uL; seed++) {
+		var sim = Sim.new(5, seed);
+		sim.listener = newListener();
+		sim.faults.deliverPct = 60;
+		sim.faults.dropPct = 10;
+		sim.faults.crashPct = 2;
+		sim.faults.restartPct = 10;
+		for (i < 5) sim.propose(i, 10 * (i + 1));
+		for (r < 300) sim.step();
+		// Let the system stabilize.
+		sim.faults.crashPct = 0;
+		sim.faults.dropPct = 0;
+		sim.restartAll();
+		var err = runUntilDecided(sim, 5000);
+		if (err != null) return err;
+	}
+	return null;
+}
+
+def runUntilDecided(sim: Sim, maxRounds: int) -> string {
+	for (r < maxRounds) {
+		if (sim.checker.violation != null) return sim.checker.violation;
+		if (sim.allDecided()) return expectDecided(sim, sim.n, sim.checker.chosen);
+		sim.step();
+	}
+	return StringBuilder.new().put1("not all nodes decided after %d rounds", maxRounds).toString();
+}
+
+def newListener() -> SimListener {
+	if (trace) return TextLog.new();
+	if (verbose) return Diagram.new();
+	return SimListener.new();
+}
+
+def contains(s: string, sub: string) -> bool {
+	for (i = 0; i + sub.length <= s.length; i++) {
+		if (Strings.equal(Arrays.range(s, i, i + sub.length), sub)) return true;
+	}
+	return false;
+}
