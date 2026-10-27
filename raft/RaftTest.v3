@@ -1,0 +1,536 @@
+// Raft simulation harness, safety checker, scenarios, and fuzzer.
+
+def main(args: Array<string>) -> int {
+	return Driver.run(RaftSuite.new("raft", [
+		("vote", "votedFor is not persisted across crashes (double voting)"),
+		("uptodate", "votes are granted without the log up-to-date check"),
+		("commit", "leader commits old-term entries by counting replicas (Figure 8)"),
+		("truncate", "follower truncates its log after prevIndex even when entries match")
+	]), args);
+}
+
+def renderRaft(m: RaftMsg, buf: StringBuilder) -> StringBuilder {
+	return m.render(buf);
+}
+
+// Commands submitted after the network stabilizes are numbered from here.
+def RAFT_POST_BASE = 1000000;
+
+// A simulation of a Raft cluster, with a global oracle that checks safety.
+def raftSubmit(cmd: int, node: Node<RaftMsg>) {
+	RaftNode.!(node).submit(cmd);
+}
+
+class RaftSim extends Sim<RaftMsg> {
+	def config = RaftConfig.new();
+	var checker: RaftChecker;
+	var nextCmd = 1;
+
+	new(n: int, seed: u64, opts: TestOptions) super(n, seed, renderRaft) {
+		addTimer(10, 20);			// RaftTimer.ELECTION
+		addTimer(3, 3);				// RaftTimer.HEARTBEAT
+		checker = RaftChecker.new(this);
+		listener = opts.listener<RaftMsg>();
+		if (opts.hasBug("vote")) config.persistVote = false;
+		if (opts.hasBug("uptodate")) config.upToDateCheck = false;
+		if (opts.hasBug("commit")) config.commitCurrentTerm = false;
+		if (opts.hasBug("truncate")) config.truncateOnMatch = true;
+		for (i < n) nodes[i] = RaftNode.new(i, n, config, checker);
+	}
+	def node(i: int) -> RaftNode {
+		return RaftNode.!(nodes[i]);
+	}
+	// A client submits {cmd} to node {i}.
+	def submit(i: int, cmd: int) -> this {
+		if (!up[i]) return;
+		var node = node(i), leader = node.role == RaftRole.LEADER;
+		var buf = StringBuilder.new().put1("client submits %d", cmd);
+		if (!leader) buf.puts(if(node.leaderId >= 0, " (forwarded to leader)", " (dropped: no known leader)"));
+		nodeEvent(i, 'o', buf.toString());
+		act(i, raftSubmit(cmd, _));
+	}
+	// A client submits a fresh command to node {i}.
+	def submitNext(i: int) -> this {
+		submit(i, nextCmd++);
+	}
+	def elect(i: int) -> this {
+		fire(i, RaftTimer.ELECTION);
+	}
+	def heartbeat(i: int) -> this {
+		fire(i, RaftTimer.HEARTBEAT);
+	}
+	def describeTimer(i: int, kind: int) -> string {
+		var node = node(i), leader = node.role == RaftRole.LEADER;
+		if (kind == RaftTimer.ELECTION) return if(leader, "election timer (ignored by leader)", "election timeout");
+		return if(leader, "heartbeat", "heartbeat timer (not leader: stops)");
+	}
+	// Checks the Log Matching property on every pair of nodes.
+	def checkLogs() {
+		for (i < n) {
+			for (j = i + 1; j < n; j++) checkPair(i, j);
+		}
+	}
+	private def checkPair(i: int, j: int) {
+		var a = node(i).stable.log, b = node(j).stable.log;
+		var len = if(a.length < b.length, a.length, b.length);
+		var same = true;
+		for (k < len) {
+			var x = a[k], y = b[k];
+			if (x.term == y.term && !(same && x.cmd == y.cmd)) {
+				fail(StringBuilder.new().put3("log matching: nodes %d and %d both have term %d", i, j, x.term)
+					.put1(" at index %d, but their logs differ up to there", k + 1).toString());
+				return;
+			}
+			same = same && x == y;
+		}
+	}
+}
+
+// Global oracle: checks Election Safety, Leader Completeness, and State Machine Safety.
+class RaftChecker extends RaftObserver {
+	def sim: RaftSim;
+	def leaders = HashMap<int, int>.new(int.!<int>, int.==);	// term -> leader
+	def committed = Vector<RaftEntry>.new();			// entries known to be committed
+	var postApplied: Array<bool>;	// per node: applied a command submitted after stabilizing
+
+	new(sim) {
+		postApplied = Array.new(sim.n);
+	}
+
+	def onElection(node: int, term: int) {
+		sim.nodeEvent(node, 'C', StringBuilder.new().put1("starts election for term %d", term).toString());
+	}
+	def onLeader(node: int, term: int, log: Vector<RaftEntry>) {
+		if (leaders.has(term)) {
+			sim.fail(StringBuilder.new().put3("election safety: nodes %d and %d both leaders of term %d", leaders[term], node, term).toString());
+		}
+		leaders[term] = node;
+		sim.nodeEvent(node, 'L', StringBuilder.new().put1("becomes leader of term %d", term).toString());
+		for (i < committed.length) {
+			if (i >= log.length || log[i] != committed[i]) {
+				var buf = StringBuilder.new().put2("leader completeness: leader %d of term %d lacks committed entry ", node, term);
+				committed[i].render(buf.put1("%d=", i + 1));
+				sim.fail(buf.toString());
+				return;
+			}
+		}
+	}
+	def onApply(node: int, index: int, entry: RaftEntry) {
+		if (index <= committed.length) {
+			var c = committed[index - 1];
+			if (c != entry) {
+				var buf = StringBuilder.new().put2("state machine safety: node %d applied index %d = ", node, index);
+				entry.render(buf).puts(" but ");
+				c.render(buf).puts(" was committed");
+				sim.fail(buf.toString());
+			}
+		} else if (index == committed.length + 1) {
+			committed.put(entry);
+		} else {
+			sim.fail(StringBuilder.new().put2("node %d applied index %d out of order", node, index).toString());
+		}
+		if (entry.cmd >= RAFT_POST_BASE) postApplied[node] = true;
+		sim.nodeEvent(node, '#', entry.render(StringBuilder.new().put1("applies %d=", index)).toString());
+	}
+	def allPostApplied() -> bool {
+		for (b in postApplied) if (!b) return false;
+		return true;
+	}
+}
+
+class RaftSuite extends Suite {
+	new(name: string, bugs: Array<(string, string)>) super(name, bugs) { }
+
+	def scenarios() -> Array<Scenario> {
+		return [
+			Scenario("election and replication", basicReplication),
+			Scenario("leader crash and re-election", leaderCrash),
+			Scenario("lagging follower catches up", laggingFollower),
+			Scenario("conflicting entries are overwritten", conflictRepair),
+			Scenario("split vote resolves", splitVote),
+			Scenario("stale leader steps down", staleLeader),
+			Scenario("figure 8: old-term entry is not committed by counting", figure8),
+			Scenario("BUG(commit): figure 8 violates safety", buggyFigure8Detected),
+			Scenario("lossy, duplicating, reordering network", lossyNetwork),
+			Scenario("crashing nodes and lossy network", crashyNetwork)
+		];
+	}
+
+	// Each fuzz run draws a random cluster size, timers, and fault profile from its
+	// seed, runs a chaotic phase with faults and client commands, then a stable
+	// phase in which a new command must be applied on every node.
+	def fuzzOne(s: int, opts: TestOptions) -> RunResult {
+		var rng = Rng.new(u64.view(s));
+		var n = rng.between(1, 7);
+		var sim = RaftSim.new(n, rng.next(), opts);
+		var f = sim.faults;
+		f.deliverPct = rng.between(10, 100);
+		f.dropPct = if(rng.chance(70), rng.between(0, 40));
+		f.dupPct = if(rng.chance(50), rng.between(0, 30));
+		f.crashPct = if(rng.chance(70), rng.between(0, 8));
+		f.restartPct = rng.between(2, 40);
+		var emin = rng.between(2, 15), emax = emin + rng.between(0, 15), hb = rng.between(1, 5);
+		sim.setTimer(RaftTimer.ELECTION, emin, emax);
+		sim.setTimer(RaftTimer.HEARTBEAT, hb, hb);
+		var submitPct = rng.between(1, 50);
+		// A new leader's no-op entry is optional; without it, old-term entries linger
+		// uncommitted longer, which exposes Figure 8-style bugs.
+		sim.config.noopOnElect = rng.chance(50);
+		var chaos = rng.between(0, opts.chaos);
+		var config = StringBuilder.new()
+			.put3("nodes=%d chaos=%d election=[%d,", n, chaos, emin)
+			.put3("%d] heartbeat=%d submit=%d%% ", emax, hb, submitPct)
+			.puts(if(sim.config.noopOnElect, "noop=on ", "noop=off "));
+		f.render(config);
+		var configStr = config.toString();
+		if (opts.verbose) System.puts(StringBuilder.new().put2("seed=%d: %s\n", s, configStr).toString());
+
+		// Phase 1: chaos, with client commands submitted to random nodes.
+		for (r < chaos) {
+			if (rng.chance(submitPct)) sim.submitNext(rng.range(n));
+			sim.step();
+			sim.checkLogs();
+			if (sim.violation != null) break;
+		}
+		// Phase 2: the network stabilizes; a new command must be applied everywhere.
+		var post = 0;
+		if (sim.violation == null) {
+			sim.note("--- network stabilizes ---");
+			f.stabilize();
+			sim.setTimer(RaftTimer.ELECTION, 10, 20);
+			sim.setTimer(RaftTimer.HEARTBEAT, 2, 2);
+			sim.restartAll();
+			for (r < opts.bound) {
+				if (sim.checker.allPostApplied() || sim.violation != null) break;
+				if (r % 20 == 0) sim.submit(rng.range(n), RAFT_POST_BASE + post++);
+				sim.step();
+				sim.checkLogs();
+			}
+		}
+		var error: string, isSafety = false;
+		if (sim.violation != null) {
+			error = sim.violation;
+			isSafety = true;
+		} else if (!sim.checker.allPostApplied()) {
+			var count = 0;
+			for (b in sim.checker.postApplied) if (b) count++;
+			error = StringBuilder.new().put2("liveness: only %d of %d nodes applied a new command", count, n)
+				.put1(" within %d rounds of stabilizing", opts.bound).toString();
+		}
+		if (opts.verbose) {
+			System.puts(StringBuilder.new()
+				.put3("committed=%d rounds=%d delivered=%d ", sim.checker.committed.length, sim.round, sim.delivered)
+				.put3("dropped=%d duplicated=%d crashes=%d\n", sim.dropped, sim.duplicated, sim.crashes)
+				.toString());
+		}
+		return RunResult.new(error, isSafety, configStr, sim.round, sim.delivered);
+	}
+}
+
+def newSim(opts: TestOptions, n: int, seed: u64) -> RaftSim {
+	var sim = RaftSim.new(n, seed, opts);
+	sim.autoTimers = false;
+	return sim;
+}
+
+// Checks safety, and that nodes [0, count) have identical logs and have applied {applied} entries.
+def expectApplied(sim: RaftSim, count: int, applied: int) -> string {
+	sim.checkLogs();
+	if (sim.violation != null) return sim.violation;
+	var log0 = sim.node(0).stable.log;
+	for (i < count) {
+		var node = sim.node(i);
+		if (node.lastApplied != applied) {
+			return StringBuilder.new().put3("node %d applied %d entries, expected %d", i, node.lastApplied, applied).toString();
+		}
+		var log = node.stable.log;
+		if (log.length != log0.length) return StringBuilder.new().put2("node %d log differs from node 0's", i, 0).toString();
+		for (k < log.length) {
+			if (log[k] != log0[k]) return StringBuilder.new().put2("node %d log differs from node 0's at %d", i, k + 1).toString();
+		}
+	}
+	return null;
+}
+def expectLeader(sim: RaftSim, i: int, term: int) -> string {
+	if (sim.violation != null) return sim.violation;
+	var node = sim.node(i);
+	if (node.role != RaftRole.LEADER || node.term() != term) {
+		return StringBuilder.new().put3("node %d should be leader of term %d (has term %d)", i, term, node.term()).toString();
+	}
+	return null;
+}
+// Delivers messages matching {pred} and drops all others, until nothing is in flight.
+def exchange(sim: RaftSim, pred: Packet<RaftMsg> -> bool) {
+	while (sim.inFlight.length > 0) {
+		sim.dropIf(negate(pred, _));
+		sim.deliverIf(pred);
+	}
+}
+def exchangeAll(sim: RaftSim) {
+	exchange(sim, anyPacket);
+}
+
+// Message selection predicates, used with partial application.
+def anyPacket(p: Packet<RaftMsg>) -> bool {
+	return true;
+}
+def negate(pred: Packet<RaftMsg> -> bool, p: Packet<RaftMsg>) -> bool {
+	return !pred(p);
+}
+def among(nodes: Array<int>, p: Packet<RaftMsg>) -> bool {
+	return isIn(nodes, p.src) && isIn(nodes, p.dst);
+}
+def isIn(nodes: Array<int>, x: int) -> bool {
+	for (i in nodes) if (i == x) return true;
+	return false;
+}
+def rvFromTo(src: int, dst: int, p: Packet<RaftMsg>) -> bool {
+	return p.src == src && p.dst == dst && RaftMsg.RequestVote.?(p.msg);
+}
+
+// Node 0 is elected, replicates three commands, and everyone applies them.
+def basicReplication(opts: TestOptions) -> string {
+	var sim = newSim(opts, 3, 1);
+	sim.elect(0);
+	exchangeAll(sim);
+	var err = expectLeader(sim, 0, 1);
+	if (err != null) return err;
+	sim.submitNext(0).submitNext(1).submitNext(2);	// nodes 1 and 2 forward to the leader
+	exchangeAll(sim);
+	sim.heartbeat(0);				// propagate the commit index
+	exchangeAll(sim);
+	return expectApplied(sim, 3, 4);		// no-op + 3 commands
+}
+
+// The leader crashes; a new leader is elected and keeps the committed entries.
+// The old leader restarts and catches up.
+def leaderCrash(opts: TestOptions) -> string {
+	var sim = newSim(opts, 5, 2);
+	sim.elect(0);
+	exchangeAll(sim);
+	sim.submitNext(0).submitNext(0);
+	exchangeAll(sim);
+	sim.heartbeat(0);
+	exchangeAll(sim);
+	sim.crash(0);
+	sim.elect(1);
+	exchangeAll(sim);
+	var err = expectLeader(sim, 1, 2);
+	if (err != null) return err;
+	sim.submitNext(1);
+	exchangeAll(sim);
+	sim.restart(0).heartbeat(1);
+	exchangeAll(sim);
+	return expectApplied(sim, 5, 5);		// no-op, 1, 2, no-op, 3
+}
+
+// A follower is down while the leader commits entries; afterwards, the leader
+// backs off nextIndex and brings it up to date.
+def laggingFollower(opts: TestOptions) -> string {
+	var sim = newSim(opts, 3, 3);
+	sim.elect(0);
+	exchangeAll(sim);
+	sim.crash(2);
+	for (i < 5) sim.submitNext(0);
+	exchangeAll(sim);
+	sim.restart(2).heartbeat(0);
+	exchangeAll(sim);
+	sim.heartbeat(0);
+	exchangeAll(sim);
+	return expectApplied(sim, 3, 6);
+}
+
+// The leader appends two entries nobody else sees, then crashes. A new leader
+// commits different entries; when the old leader returns, its uncommitted
+// entries are overwritten.
+def conflictRepair(opts: TestOptions) -> string {
+	var sim = newSim(opts, 3, 4);
+	sim.elect(0);
+	exchangeAll(sim);
+	sim.heartbeat(0);
+	exchangeAll(sim);
+	sim.submitNext(0).submitNext(0);
+	sim.dropIf(anyPacket);				// entries 1 and 2 reach nobody
+	sim.crash(0);
+	sim.elect(1);
+	exchangeAll(sim);
+	sim.submitNext(1);
+	exchangeAll(sim);
+	sim.restart(0).heartbeat(1);
+	exchangeAll(sim);
+	sim.heartbeat(1);
+	exchangeAll(sim);
+	var err = expectApplied(sim, 3, 3);		// no-op t1, no-op t2, 3
+	if (err != null) return err;
+	for (e in sim.node(0).stable.log.copy()) {
+		if (e.cmd == 1 || e.cmd == 2) return "uncommitted entry was not overwritten";
+	}
+	return null;
+}
+
+// Two candidates split the vote among four nodes; nobody wins term 1.
+// A later election succeeds.
+def splitVote(opts: TestOptions) -> string {
+	var sim = newSim(opts, 4, 5);
+	sim.elect(0).elect(1);
+	sim.deliverIf(rvFromTo(0, 2, _));
+	sim.deliverIf(rvFromTo(1, 3, _));
+	exchangeAll(sim);
+	for (i < 4) if (sim.node(i).role == RaftRole.LEADER) return "nobody should win a split vote";
+	sim.elect(0);
+	exchangeAll(sim);
+	return expectLeader(sim, 0, 2);
+}
+
+// Leader 0 is partitioned away; nodes 1 and 2 elect a new leader. When the
+// partition heals, 0's AppendEntries are rejected, it steps down, and its
+// uncommitted command is discarded.
+def staleLeader(opts: TestOptions) -> string {
+	var sim = newSim(opts, 3, 6);
+	sim.elect(0);
+	exchangeAll(sim);
+	sim.heartbeat(0);
+	exchangeAll(sim);
+	sim.elect(1);
+	exchange(sim, among([1, 2], _));		// 0 is partitioned
+	var err = expectLeader(sim, 1, 2);
+	if (err != null) return err;
+	if (sim.node(0).role != RaftRole.LEADER) return "node 0 should still think it is leader";
+	sim.submit(0, 99);				// the stale leader accepts a command...
+	exchangeAll(sim);				// ...but its AppendEntries are rejected
+	if (sim.node(0).role != RaftRole.FOLLOWER) return "stale leader should step down";
+	sim.heartbeat(1);
+	exchangeAll(sim);
+	sim.heartbeat(1);
+	exchangeAll(sim);
+	err = expectApplied(sim, 3, 2);			// no-op t1, no-op t2
+	if (err != null) return err;
+	for (e in sim.node(0).stable.log.copy()) if (e.cmd == 99) return "stale command survived";
+	return null;
+}
+
+// Figure 8 of the Raft paper, with nodes 0-4 for S1-S5 (and no no-op entries,
+// which would otherwise mask the problem):
+//  (a) node 0 leads term 2 and replicates entry 2 (term 2) to node 1 only;
+//  (b) node 4 leads term 3 and appends a different entry 2 (term 3) locally;
+//  (c) node 0 leads term 4 and replicates its entry 2 (term 2) to a majority;
+//  (d) node 4 leads term 5 and overwrites entry 2 everywhere.
+// In (c), the correct protocol must not commit entry 2 by counting replicas.
+def figure8(opts: TestOptions) -> string {
+	return runFigure8(opts, false);
+}
+def buggyFigure8Detected(opts: TestOptions) -> string {
+	var err = runFigure8(opts, true);
+	if (err == null) return "bug was not detected";
+	if (opts.verbose) System.puts(StringBuilder.new().puts("  (detected: ").puts(err).puts(")\n").toString());
+	return null;
+}
+def runFigure8(opts: TestOptions, buggy: bool) -> string {
+	var sim = newSim(opts, 5, 7);
+	sim.config.noopOnElect = false;
+	if (buggy) sim.config.commitCurrentTerm = false;
+	// Setup: node 0 leads term 1 and commits entry 1 everywhere.
+	sim.elect(0);
+	exchangeAll(sim);
+	sim.submit(0, 1);
+	exchangeAll(sim);
+	sim.heartbeat(0);
+	exchangeAll(sim);
+	sim.note("--- (a) ---");
+	sim.crash(0).restart(0).elect(0);		// term 2
+	exchange(sim, among([0, 1, 2], _));
+	sim.submit(0, 2);
+	exchange(sim, among([0, 1], _));		// entry 2 (term 2) on nodes 0, 1
+	sim.note("--- (b) ---");
+	sim.crash(0);
+	sim.elect(4);					// term 2: fails
+	sim.dropIf(anyPacket);
+	sim.elect(4);					// term 3
+	exchange(sim, among([2, 3, 4], _));
+	var err = expectLeader(sim, 4, 3);
+	if (err != null) return err;
+	sim.submit(4, 3);
+	sim.dropIf(anyPacket);				// entry 2 (term 3) on node 4 only
+	sim.note("--- (c) ---");
+	sim.crash(4).restart(0);
+	sim.elect(0);					// term 3: fails
+	sim.dropIf(anyPacket);
+	sim.elect(0);					// term 4
+	exchange(sim, among([0, 1, 2, 3], _));		// entry 2 (term 2) on a majority
+	err = expectLeader(sim, 0, 4);
+	if (err != null) return err;
+	sim.note("--- (d) ---");
+	sim.crash(0).restart(4);
+	sim.elect(4);					// term 4: fails
+	sim.dropIf(anyPacket);
+	sim.elect(4);					// term 5
+	exchange(sim, among([1, 2, 3, 4], _));
+	err = expectLeader(sim, 4, 5);
+	if (err != null) return err;
+	sim.submit(4, 4);
+	exchange(sim, among([1, 2, 3, 4], _));		// overwrites entry 2 everywhere
+	sim.restart(0).heartbeat(4);
+	exchangeAll(sim);
+	sim.heartbeat(4);
+	exchangeAll(sim);
+	err = expectApplied(sim, 5, 3);			// 1:1, 3:3, 5:4
+	if (err != null) return err;
+	if (sim.node(0).entryAt(2).cmd != 3) return "entry 2 should be node 4's command";
+	return null;
+}
+
+def lossyNetwork(opts: TestOptions) -> string {
+	for (seed = 100uL; seed < 110uL; seed++) {
+		var sim = RaftSim.new(5, seed, opts);
+		sim.faults.deliverPct = 50;
+		sim.faults.dropPct = 20;
+		sim.faults.dupPct = 20;
+		var err = runRandom(sim, 300);
+		if (err != null) return err;
+	}
+	return null;
+}
+
+def crashyNetwork(opts: TestOptions) -> string {
+	for (seed = 200uL; seed < 210uL; seed++) {
+		var sim = RaftSim.new(5, seed, opts);
+		sim.faults.deliverPct = 60;
+		sim.faults.dropPct = 10;
+		sim.faults.crashPct = 3;
+		sim.faults.restartPct = 15;
+		var err = runRandom(sim, 300);
+		if (err != null) return err;
+	}
+	return null;
+}
+
+// Runs {rounds} rounds with random client commands, then stabilizes and
+// requires all nodes to converge on identical, fully applied logs.
+def runRandom(sim: RaftSim, rounds: int) -> string {
+	for (r < rounds) {
+		if (sim.rng.chance(20)) sim.submitNext(sim.rng.range(sim.n));
+		sim.step();
+		sim.checkLogs();
+		if (sim.violation != null) return sim.violation;
+	}
+	sim.faults.stabilize();
+	sim.faults.deliverPct = 100;
+	sim.restartAll();
+	var post = 0;
+	for (r < 3000) {
+		if (sim.violation != null) return sim.violation;
+		if (sim.checker.allPostApplied() && converged(sim)) return null;
+		if (r % 20 == 0) sim.submit(sim.rng.range(sim.n), RAFT_POST_BASE + post++);
+		sim.step();
+		sim.checkLogs();
+	}
+	return "did not converge after 3000 rounds";
+}
+def converged(sim: RaftSim) -> bool {
+	var a = sim.node(0);
+	for (i < sim.n) {
+		var b = sim.node(i);
+		if (b.lastApplied != a.lastApplied || b.lastIndex() != a.lastIndex() || b.lastApplied != b.lastIndex()) return false;
+	}
+	return true;
+}

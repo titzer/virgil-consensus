@@ -7,70 +7,67 @@
 //       1   X---->|---->|      Prepare(b=3)
 //           |<----X-----X      Promise(b=3, ab=0, av=0)
 //
-// Legend:  X sender   > < receiver   x lost   ! crash   + restart   # learn
-class Diagram extends SimListener {
+// Legend:  X sender   > < receiver   x lost   o timer   ! crash   + restart
+// Protocols report their own events (e.g. '#' for learning a value) via {Sim.nodeEvent}.
+// Byzantine nodes are labeled B<i> instead of N<i> in the header.
+class Diagram<M> extends SimListener<M> {
 	def W = 6;		// column width per node
 	def PREFIX = 7;		// width of the round number column
 	var started = false;
 	var lastRound = -1;
-	var pending = Vector<(Packet, bool)>.new();	// buffered (packet, lost) events
+	var pending = Vector<(Packet<M>, bool)>.new();	// buffered (packet, lost) events
 
-	def onTimeout(sim: Sim, node: int) {
-		var what = if(sim.nodes[node].proposal != 0, "timeout: starts a ballot", "timeout: queries for outcome");
-		mark(sim, node, 'o', StringBuilder.new().put1("N%d ", node).puts(what));
+	def onTimer(sim: Sim<M>, node: int, kind: int) {
+		mark(sim, node, 'o', StringBuilder.new().put2("N%d %s", node, sim.describeTimer(node, kind)));
 	}
-	def onCrash(sim: Sim, node: int) {
+	def onCrash(sim: Sim<M>, node: int) {
 		mark(sim, node, '!', StringBuilder.new().put1("N%d CRASHES", node));
 	}
-	def onRestart(sim: Sim, node: int) {
+	def onRestart(sim: Sim<M>, node: int) {
 		mark(sim, node, '+', StringBuilder.new().put1("N%d restarts (volatile state lost)", node));
 	}
-	def onDeliver(sim: Sim, p: Packet) {
+	def onDeliver(sim: Sim<M>, p: Packet<M>) {
 		pending.put((p, false));
 	}
-	def onDrop(sim: Sim, p: Packet) {
+	def onDrop(sim: Sim<M>, p: Packet<M>) {
 		pending.put((p, true));
 	}
-	def onChosen(sim: Sim, value: int, ballot: int) {
-		flush(sim);
-		emit(sim, lifelines(sim), StringBuilder.new().put2("*** value %d is chosen (ballot %d) ***", value, ballot));
+	def onNodeEvent(sim: Sim<M>, node: int, ch: byte, msg: string) {
+		mark(sim, node, ch, StringBuilder.new().put2("N%d %s", node, msg));
 	}
-	def onLearned(sim: Sim, node: int, value: int) {
-		mark(sim, node, '#', StringBuilder.new().put2("N%d learns %d", node, value));
-	}
-	def onViolation(sim: Sim, msg: string) {
+	def onViolation(sim: Sim<M>, msg: string) {
 		flush(sim);
 		emit(sim, lifelines(sim), StringBuilder.new().puts("!!! SAFETY VIOLATION: ").puts(msg));
 	}
-	def onNote(sim: Sim, msg: string) {
+	def onNote(sim: Sim<M>, msg: string) {
 		flush(sim);
-		emit(sim, lifelines(sim), StringBuilder.new().puts("--- ").puts(msg).puts(" ---"));
+		emit(sim, lifelines(sim), StringBuilder.new().puts(msg));
 	}
-	def onQuiet(sim: Sim) {
+	def onQuiet(sim: Sim<M>) {
 		flush(sim);
 	}
 
 	// Prints a single-node event, marking the node's lifeline with {ch}.
-	private def mark(sim: Sim, node: int, ch: byte, note: StringBuilder) {
+	private def mark(sim: Sim<M>, node: int, ch: byte, note: StringBuilder) {
 		flush(sim);
 		var line = lifelines(sim);
 		line[center(node)] = ch;
 		emit(sim, line, note);
 	}
 	// Prints all buffered deliveries, grouping identical messages.
-	private def flush(sim: Sim) {
+	private def flush(sim: Sim<M>) {
 		if (pending.length == 0) return;
-		var groups = Vector<Group>.new();
+		var groups = Vector<Group<M>>.new();
 		// Group by (src, msg): one sender's broadcast becomes one group.
 		for (i < pending.length) {
 			var e = pending[i], p = e.0;
-			var g: Group;
+			var g: Group<M>;
 			for (j < groups.length) {
 				var h = groups[j];
 				if (h.srcs[p.src] && h.msg == p.msg) { g = h; break; }
 			}
 			if (g == null) {
-				groups.put(g = Group.new(p.msg, Array<bool>.new(sim.n), Array<int>.new(sim.n)));
+				groups.put(g = Group<M>.new(p.msg, Array<bool>.new(sim.n), Array<int>.new(sim.n)));
 				g.srcs[p.src] = true;
 			}
 			g.dsts[p.dst] = if(e.1, LOST, RECEIVED);
@@ -78,9 +75,9 @@ class Diagram extends SimListener {
 		pending.clear();
 		// Merge groups that sent the same message to the same destinations,
 		// e.g. several acceptors' Promises to one proposer.
-		var merged = Vector<Group>.new();
+		var merged = Vector<Group<M>>.new();
 		for (i < groups.length) {
-			var g = groups[i], into: Group;
+			var g = groups[i], into: Group<M>;
 			for (j < merged.length) {
 				var h = merged[j];
 				if (h.msg == g.msg && sameDsts(h, g) && separable(h, g)) { into = h; break; }
@@ -97,7 +94,7 @@ class Diagram extends SimListener {
 		for (i < merged.length) draw(sim, merged[i]);
 	}
 	// Two groups have the same destinations, ignoring each sender's message to itself.
-	private def sameDsts(a: Group, b: Group) -> bool {
+	private def sameDsts(a: Group<M>, b: Group<M>) -> bool {
 		for (k < a.dsts.length) {
 			if (a.srcs[k] || b.srcs[k]) continue;
 			if (a.dsts[k] != b.dsts[k]) return false;
@@ -105,7 +102,7 @@ class Diagram extends SimListener {
 		return true;
 	}
 	// Merging is only drawn sensibly if all receivers lie on one side of all senders.
-	private def separable(a: Group, b: Group) -> bool {
+	private def separable(a: Group<M>, b: Group<M>) -> bool {
 		var minS = a.srcs.length, maxS = -1;
 		for (k < a.srcs.length) {
 			if (a.srcs[k] || b.srcs[k]) {
@@ -120,7 +117,7 @@ class Diagram extends SimListener {
 		}
 		return true;
 	}
-	private def draw(sim: Sim, g: Group) {
+	private def draw(sim: Sim<M>, g: Group<M>) {
 		var n = sim.n, line = lifelines(sim);
 		// Many senders replying to one of themselves (e.g. Promises to a proposer):
 		// draw that node as the receiver, so the replies point at it.
@@ -162,13 +159,13 @@ class Diagram extends SimListener {
 			}
 			if (g.dsts[k] == LOST) lost.put1(" N%d", k);
 		}
-		var note = g.msg.render(StringBuilder.new());
+		var note = sim.render(g.msg, StringBuilder.new());
 		if (onlySelf) note.puts("  (to self)");
 		if (lost.length > 0) note.puts("  lost:").puts(lost.toString());
 		emit(sim, line, note);
 	}
 	// A blank line with each node's lifeline: '|' if up, ':' if down.
-	private def lifelines(sim: Sim) -> Array<byte> {
+	private def lifelines(sim: Sim<M>) -> Array<byte> {
 		var line = Array<byte>.new(sim.n * W);
 		for (i < line.length) line[i] = ' ';
 		for (k < sim.n) line[center(k)] = if(sim.up[k], '|', ':');
@@ -177,13 +174,13 @@ class Diagram extends SimListener {
 	private def center(node: int) -> int {
 		return node * W + W / 2;
 	}
-	private def emit(sim: Sim, line: Array<byte>, note: StringBuilder) {
+	private def emit(sim: Sim<M>, line: Array<byte>, note: StringBuilder) {
 		var buf = StringBuilder.new();
 		if (!started) {
 			started = true;
 			buf.puts("round ");
-			for (k < sim.n) buf.pad(' ', PREFIX + center(k) - 1).put1("N%d", k);
-			buf.ln().puts("legend: X sender, > < receiver, x lost, o timeout, ! crash, + restart, # learn").ln();
+			for (k < sim.n) buf.pad(' ', PREFIX + center(k) - 1).putc(if(sim.byzantine[k], 'B', 'N')).putd(k);
+			buf.ln().puts("legend: X sender, > < receiver, x lost, o timer, ! crash, + restart").ln();
 		}
 		var start = buf.length;
 		if (sim.round != lastRound) {
@@ -201,4 +198,4 @@ def NONE = 0;
 def RECEIVED = 1;
 def LOST = 2;
 
-private class Group(msg: Msg, srcs: Array<bool>, dsts: Array<int>) { }
+private class Group<M>(msg: M, srcs: Array<bool>, dsts: Array<int>) { }

@@ -1,0 +1,586 @@
+// PBFT simulation harness, Byzantine adversary, safety checker, scenarios, and fuzzer.
+//
+// Honest replicas never crash here (PBFT would require all their state to be
+// persistent); faulty replicas may go silent ("crash") at any point. The
+// network may drop, duplicate, and reorder messages during the chaos phase.
+
+def main(args: Array<string>) -> int {
+	return Driver.run(PbftSuite.new("pbft", [
+		("quorum", "use 2f instead of 2f+1 for commit and new-view quorums"),
+		("nosig", "skip signature checks inside view-change certificates"),
+		("newview", "accept a NewView without recomputing its proposals"),
+		("prepared", "ViewChange messages omit prepared certificates")
+	]), args);
+}
+
+def renderPbft(m: PbftMsg, buf: StringBuilder) -> StringBuilder {
+	return m.render(buf);
+}
+
+// Byzantine strategies, combined as bits.
+def PBFT_SILENT = 1;	// never sends anything
+def PBFT_CRASH = 2;	// behaves (otherwise) honestly, then goes silent at some round
+def PBFT_EQUIV = 4;	// sends conflicting versions of its messages to different replicas
+def PBFT_GARBAGE = 8;	// sends random well-formed messages
+def PBFT_FORGE = 16;	// forges signatures and certificates in view changes
+
+def renderStrategy(buf: StringBuilder, s: int) -> StringBuilder {
+	var names = ["silent", "crash", "equiv", "garbage", "forge"], first = true;
+	for (i < names.length) {
+		if ((s & (1 << u5.!(i))) == 0) continue;
+		if (!first) buf.putc('+');
+		buf.puts(names[i]);
+		first = false;
+	}
+	return buf;
+}
+
+// A simulation of a PBFT cluster with n = 3f+1 replicas and a client.
+def pbftRequest(op: int, node: Node<PbftMsg>) {
+	PbftReplica.!(node).request(op);
+}
+
+class PbftSim extends Sim<PbftMsg> {
+	def f: int;
+	def config = PbftConfig.new();
+	def VIEWCHANGE = 0;
+	def submitted = Vector<int>.new();
+	var keys: KeyRing;
+	var checker: PbftChecker;
+	var adversary: PbftAdversary;
+
+	new(f, seed: u64, opts: TestOptions) super(3 * f + 1, seed, renderPbft) {
+		addTimer(20, 40);		// VIEWCHANGE
+		listener = opts.listener<PbftMsg>();
+		if (opts.hasBug("quorum")) config.weakQuorum = true;
+		if (opts.hasBug("nosig")) config.skipCertSigs = true;
+		if (opts.hasBug("newview")) config.trustNewView = true;
+		if (opts.hasBug("prepared")) config.omitPrepared = true;
+		keys = KeyRing.new(n, rng);
+		checker = PbftChecker.new(this);
+		adversary = PbftAdversary.new(this);
+		for (i < n) nodes[i] = PbftReplica.new(i, n, f, config, keys, keys.signer(i), checker);
+	}
+	def replica(i: int) -> PbftReplica {
+		return PbftReplica.!(nodes[i]);
+	}
+	// Hands replica {i}'s keys to the adversary, which then controls it.
+	def makeFaulty(i: int, strategy: int, crashRound: int) -> this {
+		byzantine[i] = true;
+		adversary.signers[i] = keys.signer(i);
+		replica(i).hook = PbftEvil.new(adversary, strategy, crashRound);
+	}
+	// The client broadcasts a new request to all replicas.
+	def submit(op: int) -> this {
+		submitted.put(op);
+		checker.submitted[op] = true;
+		note(StringBuilder.new().put1("--- client broadcasts request op%d ---", op).toString());
+		broadcastRequest(op);
+	}
+	// The client retransmits requests that some honest replica has not executed.
+	def retransmit() -> this {
+		for (i < submitted.length) {
+			var op = submitted[i];
+			if (checker.executedByAll(op)) continue;
+			note(StringBuilder.new().put1("--- client retransmits request op%d ---", op).toString());
+			broadcastRequest(op);
+		}
+	}
+	private def broadcastRequest(op: int) {
+		for (i < n) {
+			if (!up[i]) continue;
+			act(i, pbftRequest(op, _));
+		}
+	}
+	def kick(i: int) -> this {
+		fire(i, VIEWCHANGE);
+	}
+	def describeTimer(i: int, kind: int) -> string {
+		var r = replica(i);
+		if (r.active) return StringBuilder.new().put1("view-change timer expires in view %d", r.view).toString();
+		return StringBuilder.new().put1("view-change timer expires while changing to view %d", r.view).toString();
+	}
+}
+
+// Checks that honest replicas agree on the op executed at every sequence
+// number, execute only submitted ops, and never execute an op twice.
+class PbftChecker extends PbftObserver {
+	def sim: PbftSim;
+	def submitted = HashMap<int, bool>.new(int.!<int>, int.==);
+	def seqOp = HashMap<int, int>.new(int.!<int>, int.==);	// seq -> (op + 1, first replica + 1)
+	def seqFirst = HashMap<int, int>.new(int.!<int>, int.==);
+	var execBy: Array<HashMap<int, bool>>;
+
+	new(sim) {
+		execBy = Array.new(sim.n);
+		for (i < sim.n) execBy[i] = HashMap.new(int.!<int>, int.==);
+	}
+	def onExecute(r: int, seq: int, op: int, dup: bool) {
+		if (sim.byzantine[r]) return;
+		var buf = StringBuilder.new().put1("executes s%d: ", seq);
+		PbftFmt.op(buf, op);
+		if (dup) buf.puts(" (duplicate, skipped)");
+		sim.nodeEvent(r, '#', buf.toString());
+		var prev = seqOp[seq];
+		if (prev == 0) {
+			seqOp[seq] = op + 1;
+			seqFirst[seq] = r;
+		} else if (prev - 1 != op) {
+			sim.fail(StringBuilder.new().put3("N%d executed op%d at s%d", r, op, seq)
+				.put2(" but N%d executed op%d there", seqFirst[seq], prev - 1).toString());
+		}
+		if (op == 0 || dup) return;
+		if (!submitted[op]) sim.fail(StringBuilder.new().put2("N%d executed op%d, which no client submitted", r, op).toString());
+		if (execBy[r][op]) sim.fail(StringBuilder.new().put2("N%d executed op%d twice", r, op).toString());
+		execBy[r][op] = true;
+	}
+	def onViewChange(r: int, view: int) {
+		if (!sim.byzantine[r]) sim.nodeEvent(r, 'v', StringBuilder.new().put1("starts view change to view %d", view).toString());
+	}
+	def onNewView(r: int, view: int) {
+		if (!sim.byzantine[r]) {
+			sim.nodeEvent(r, '*', StringBuilder.new().put2("enters view %d (primary N%d)", view, view % sim.n).toString());
+		}
+	}
+	def executedByAll(op: int) -> bool {
+		for (r < sim.n) if (!sim.byzantine[r] && !execBy[r][op]) return false;
+		return true;
+	}
+	def allExecuted() -> bool {
+		for (i < sim.submitted.length) if (!executedByAll(sim.submitted[i])) return false;
+		return true;
+	}
+}
+
+// One colluding adversary controls all faulty replicas. It holds only their
+// signing keys, and sees the messages sent to them and the client's requests.
+class PbftAdversary {
+	def sim: PbftSim;
+	var signers: Array<Signer>;		// non-null for faulty replicas
+	def ops = Vector<int>.new();		// client requests seen
+	def forged = HashMap<int, bool>.new(int.!<int>, int.==);	// views with a forged ViewChange
+	var forgeOp = -1;			// op for forged certificates; -1 = random
+
+	new(sim) {
+		signers = Array.new(sim.n);
+	}
+	def rng() -> Rng {
+		return sim.rng;
+	}
+	def addOp(op: int) {
+		for (i < ops.length) if (ops[i] == op) return;
+		ops.put(op);
+	}
+	// A different op than {op}: another client request, the null op, or a fabricated one.
+	def otherOp(op: int) -> int {
+		var r = rng();
+		for (i < 4) {
+			if (ops.length == 0) break;
+			var x = ops[r.range(ops.length)];
+			if (x != op) return x;
+		}
+		return if(op != 0 && r.chance(50), 0, 9000 + r.range(100));
+	}
+	// Signs {digest} as {signer} if the adversary holds its key; otherwise forges a bogus signature.
+	def sign(signer: int, digest: u64) -> Sig {
+		var s = signers[signer];
+		if (s != null) return s.sign(digest);
+		return Sig(signer, digest, rng().next());
+	}
+	// A prepared certificate for {op} at {seq} in view {pv}, forging the signatures of honest replicas.
+	def forgeCert(f: int, pv: int, seq: int, op: int) -> PbftCert {
+		var n = sim.n, primary = pv % n;
+		var pp = PbftPP(pv, seq, op, sign(primary, PbftDigest.pp(pv, seq, op)));
+		var d = PbftDigest.op(op), prepares = Vector<PbftVote>.new();
+		for (i < n) {
+			if (i == primary || prepares.length >= 2 * f) continue;
+			prepares.put(PbftVote(pv, seq, d, sign(i, PbftDigest.vote(PbftDigest.PREPARE, pv, seq, d))));
+		}
+		return PbftCert(pp, prepares.extract());
+	}
+	// Replica {r} sends a ViewChange to view {w} with a forged certificate, once per view.
+	def forgeVC(r: PbftReplica, w: int) {
+		if (forged[w] || w < 1) return;
+		forged[w] = true;
+		var seq = rng().between(1, r.lastExec + 2);
+		var op = if(forgeOp >= 0, forgeOp, otherOp(-1));
+		var certs = [forgeCert(r.f, w - 1, seq, op)];
+		var vc = PbftVC(w, certs, r.signer.sign(PbftDigest.vc(w, certs)));
+		r.broadcast(PbftMsg.ViewChange(vc));
+	}
+	// A different version of {msg}, validly signed by faulty replica {r}.
+	def mutate(r: PbftReplica, msg: PbftMsg) -> PbftMsg {
+		match (msg) {
+			PrePrepare(pp) => {
+				var op = otherOp(pp.op);
+				return PbftMsg.PrePrepare(PbftPP(pp.view, pp.seq, op, r.signer.sign(PbftDigest.pp(pp.view, pp.seq, op))));
+			}
+			Prepare(v) => return PbftMsg.Prepare(r.vote(PbftDigest.PREPARE, v.view, v.seq, PbftDigest.op(otherOp(PbftDigest.opOf(v.digest)))));
+			Commit(v) => return PbftMsg.Commit(r.vote(PbftDigest.COMMIT, v.view, v.seq, PbftDigest.op(otherOp(PbftDigest.opOf(v.digest)))));
+			ViewChange(vc) => {
+				// Lie: claim nothing was prepared.
+				var none = Array<PbftCert>.new(0);
+				return PbftMsg.ViewChange(PbftVC(vc.newView, none, r.signer.sign(PbftDigest.vc(vc.newView, none))));
+			}
+			NewView(v, vcs, pps, sig) => {
+				// Propose different ops than the ViewChanges justify, and maybe an extra one.
+				var len = pps.length + if(rng().chance(50), 1, 0);
+				var npps = Array<PbftPP>.new(len);
+				for (i < len) {
+					var op = if(i < pps.length, pps[i].op, 0);
+					if (i >= pps.length || rng().chance(70)) op = otherOp(op);
+					npps[i] = PbftPP(v, i + 1, op, r.signer.sign(PbftDigest.pp(v, i + 1, op)));
+				}
+				return PbftMsg.NewView(v, vcs, npps, r.signer.sign(PbftDigest.nv(v, vcs, npps)));
+			}
+			_ => return msg;
+		}
+	}
+	// A random well-formed message, sometimes validly signed by {r}, sometimes not.
+	def garbage(r: PbftReplica) -> PbftMsg {
+		var g = rng(), view = r.view + g.range(2), seq = g.between(1, r.lastExec + 3);
+		var op = otherOp(-1), signer = if(g.chance(50), r.id, g.range(sim.n));
+		match (g.range(7)) {
+			0 => return PbftMsg.PrePrepare(PbftPP(view, seq, op, sign(signer, PbftDigest.pp(view, seq, op))));
+			1 => {
+				var d = PbftDigest.op(op);
+				return PbftMsg.Prepare(PbftVote(view, seq, d, sign(signer, PbftDigest.vote(PbftDigest.PREPARE, view, seq, d))));
+			}
+			2 => {
+				var d = PbftDigest.op(op);
+				return PbftMsg.Commit(PbftVote(view, seq, d, sign(signer, PbftDigest.vote(PbftDigest.COMMIT, view, seq, d))));
+			}
+			3 => {
+				var w = view + 1, certs = [forgeCert(r.f, view, seq, op)];
+				return PbftMsg.ViewChange(PbftVC(w, certs, sign(signer, PbftDigest.vc(w, certs))));
+			}
+			4 => {
+				var pps = [PbftPP(view, 1, op, sign(signer, PbftDigest.pp(view, 1, op)))];
+				var vcs = Array<PbftVC>.new(0);
+				return PbftMsg.NewView(view, vcs, pps, sign(signer, PbftDigest.nv(view, vcs, pps)));
+			}
+			5 => {
+				var pp = PbftPP(view, seq, op, sign(view % sim.n, PbftDigest.pp(view, seq, op)));
+				var d = PbftDigest.op(op), commits = Array<PbftVote>.new(sim.n);
+				for (i < sim.n) commits[i] = PbftVote(view, seq, d, sign(i, PbftDigest.vote(PbftDigest.COMMIT, view, seq, d)));
+				return PbftMsg.Proof(pp, commits);
+			}
+			_ => return PbftMsg.Fetch(g.between(1, 3));
+		}
+	}
+}
+
+// Intercepts a faulty replica's inputs and outputs according to its strategy.
+class PbftEvil extends PbftHook {
+	def adv: PbftAdversary;
+	def strategy: int;
+	def crashRound: int;
+
+	new(adv, strategy, crashRound) { }
+
+	def silent() -> bool {
+		if ((strategy & PBFT_SILENT) != 0) return true;
+		return (strategy & PBFT_CRASH) != 0 && adv.sim.round >= crashRound;
+	}
+	def onReceive(r: PbftReplica, src: int, msg: PbftMsg) -> bool {
+		if (silent()) return false;
+		mischief(r);
+		if ((strategy & PBFT_FORGE) != 0 && PbftMsg.ViewChange.?(msg)) {
+			adv.forgeVC(r, PbftMsg.ViewChange.!(msg).vc.newView);
+		}
+		return true;
+	}
+	def onTimer(r: PbftReplica) -> bool {
+		if (silent()) return false;
+		mischief(r);
+		return true;
+	}
+	def onRequest(r: PbftReplica, op: int) -> bool {
+		adv.addOp(op);
+		return !silent();
+	}
+	def broadcast(r: PbftReplica, msg: PbftMsg) {
+		if (silent()) return;
+		if ((strategy & PBFT_EQUIV) == 0) {
+			r.broadcast(msg);
+			return;
+		}
+		var g = adv.rng();
+		for (i < r.n) r.send(i, if(g.chance(50), adv.mutate(r, msg), msg));
+	}
+	private def mischief(r: PbftReplica) {
+		var g = adv.rng();
+		if ((strategy & PBFT_GARBAGE) != 0 && g.chance(15)) {
+			var m = adv.garbage(r);
+			if (g.chance(50)) r.broadcast(m);
+			else r.send(g.range(r.n), m);
+		}
+		if ((strategy & PBFT_FORGE) != 0 && g.chance(5)) adv.forgeVC(r, r.view + 1);
+	}
+}
+
+class PbftSuite extends Suite {
+	new(name: string, bugs: Array<(string, string)>) super(name, bugs) { }
+
+	def scenarios() -> Array<Scenario> {
+		return [
+			Scenario("normal case", pbftNormalCase),
+			Scenario("silent primary triggers a view change", pbftSilentPrimary),
+			Scenario("two faulty primaries in a row (f=2)", pbftTwoFaultyPrimaries),
+			Scenario("equivocating primary cannot commit two ops", pbftEquivocatingPrimary),
+			Scenario("view change preserves a prepared request", pbftPreservesPrepared),
+			Scenario("forged certificate in a ViewChange is rejected", pbftForgedRejected),
+			Scenario("BUG(nosig): forged certificate is accepted", pbftForgedAcceptedBug),
+			Scenario("lossy network with Byzantine replicas converges", pbftLossy)
+		];
+	}
+
+	def fuzzOne(s: int, opts: TestOptions) -> RunResult {
+		var rng = Rng.new(u64.view(s));
+		var f = rng.between(1, 2);
+		var sim = PbftSim.new(f, rng.next(), opts);
+		var n = sim.n;
+		var chaos = rng.between(0, opts.chaos);
+		// Choose faulty replicas, often including the initial primary.
+		var numFaulty = rng.between(0, f);
+		var config = StringBuilder.new().put3("n=%d f=%d faulty=%d", n, f, numFaulty);
+		for (k < numFaulty) {
+			var i = if(k == 0 && rng.chance(70), 0, rng.range(n));
+			while (sim.byzantine[i]) i = (i + 1) % n;
+			var strategy: int, c = rng.range(100);
+			if (c < 15) strategy = PBFT_SILENT;
+			else if (c < 30) strategy = PBFT_CRASH | (if(rng.chance(50), PBFT_EQUIV));
+			else {
+				while (strategy == 0) {
+					if (rng.chance(50)) strategy |= PBFT_EQUIV;
+					if (rng.chance(50)) strategy |= PBFT_GARBAGE;
+					if (rng.chance(50)) strategy |= PBFT_FORGE;
+				}
+			}
+			var crashRound = rng.between(0, chaos + 50);
+			sim.makeFaulty(i, strategy, crashRound);
+			renderStrategy(config.put1(" B%d:", i), strategy);
+		}
+		// Choose a fault profile.
+		var faults = sim.faults;
+		faults.deliverPct = rng.between(20, 100);
+		faults.dropPct = if(rng.chance(60), rng.between(0, 30));
+		faults.dupPct = if(rng.chance(50), rng.between(0, 30));
+		var tmin = rng.between(10, 30), tmax = tmin + rng.between(0, 30);
+		sim.setTimer(sim.VIEWCHANGE, tmin, tmax);
+		// Choose when the client submits its requests.
+		var numReqs = rng.between(2, 8);
+		var when = Array<int>.new(numReqs);
+		for (i < numReqs) when[i] = rng.between(0, chaos);
+		config.put3(" chaos=%d requests=%d timeout=[%d,", chaos, numReqs, tmin).put1("%d] ", tmax);
+		faults.render(config);
+		var configStr = config.toString();
+		if (opts.verbose) System.puts(StringBuilder.new().put2("seed=%d: %s\n", s, configStr).toString());
+
+		// Phase 1: chaos.
+		for (r = 0; r <= chaos && sim.violation == null; r++) {
+			for (i < numReqs) if (when[i] == r) sim.submit(100 + i);
+			if (r > 0 && r % 25 == 0) sim.retransmit();
+			sim.step();
+		}
+		// Phase 2: the network stabilizes; every request must be executed by every honest replica.
+		if (sim.violation == null) {
+			sim.note("--- network stabilizes ---");
+			faults.stabilize();
+			for (r < opts.bound) {
+				if (sim.checker.allExecuted() || sim.violation != null) break;
+				if (r % 25 == 24) sim.retransmit();
+				sim.step();
+			}
+		}
+		var error: string, isSafety = false;
+		if (sim.violation != null) {
+			error = sim.violation;
+			isSafety = true;
+		} else if (!sim.checker.allExecuted()) {
+			var done = 0;
+			for (i < sim.submitted.length) if (sim.checker.executedByAll(sim.submitted[i])) done++;
+			error = StringBuilder.new().put2("liveness: only %d of %d requests executed by all honest replicas", done, numReqs)
+				.put1(" within %d rounds of stabilizing", opts.bound).toString();
+		}
+		if (opts.verbose) {
+			System.puts(StringBuilder.new()
+				.put3("rounds=%d delivered=%d dropped=%d\n", sim.round, sim.delivered, sim.dropped).toString());
+		}
+		return RunResult.new(error, isSafety, configStr, sim.round, sim.delivered);
+	}
+}
+
+// Scenario helpers.
+def pbftScripted(opts: TestOptions, f: int, seed: u64) -> PbftSim {
+	var sim = PbftSim.new(f, seed, opts);
+	sim.autoTimers = false;
+	return sim;
+}
+// Checks for safety violations, and that every honest replica executed every submitted request.
+def pbftExpectAll(sim: PbftSim) -> string {
+	if (sim.violation != null) return sim.violation;
+	for (i < sim.submitted.length) {
+		var op = sim.submitted[i];
+		for (r < sim.n) {
+			if (!sim.byzantine[r] && !sim.checker.execBy[r][op]) {
+				return StringBuilder.new().put2("N%d did not execute op%d", r, op).toString();
+			}
+		}
+	}
+	return null;
+}
+def pbftRunUntilDone(sim: PbftSim, maxRounds: int) -> string {
+	for (r < maxRounds) {
+		if (sim.violation != null) return sim.violation;
+		if (sim.checker.allExecuted()) return pbftExpectAll(sim);
+		if (r % 25 == 24) sim.retransmit();
+		sim.step();
+	}
+	return StringBuilder.new().put1("requests not executed after %d rounds", maxRounds).toString();
+}
+def pbftIsCommit(p: Packet<PbftMsg>) -> bool {
+	return PbftMsg.Commit.?(p.msg);
+}
+def pbftNotCommit(p: Packet<PbftMsg>) -> bool {
+	return !PbftMsg.Commit.?(p.msg);
+}
+def pbftTo(dst: int, p: Packet<PbftMsg>) -> bool {
+	return p.dst == dst;
+}
+def pbftFromTo(src: int, dst: int, p: Packet<PbftMsg>) -> bool {
+	return p.src == src && p.dst == dst;
+}
+def pbftIsPP(p: Packet<PbftMsg>) -> bool {
+	return PbftMsg.PrePrepare.?(p.msg);
+}
+def pbftViewOf(sim: PbftSim, i: int) -> int {
+	return sim.replica(i).view;
+}
+
+// f=1: three requests, all replicas honest, perfect network.
+def pbftNormalCase(opts: TestOptions) -> string {
+	var sim = pbftScripted(opts, 1, 1);
+	sim.submit(101).submit(102).submit(103);
+	sim.deliverAll();
+	return pbftExpectAll(sim);
+}
+
+// The primary (N0) is faulty and silent. The replicas' timers expire, they
+// move to view 1, and the new primary N1 orders the request.
+def pbftSilentPrimary(opts: TestOptions) -> string {
+	var sim = pbftScripted(opts, 1, 2);
+	sim.makeFaulty(0, PBFT_SILENT, 0);
+	sim.submit(101);
+	sim.deliverAll();
+	if (sim.checker.executedByAll(101)) return "executed without a primary";
+	for (i = 1; i < 4; i++) sim.kick(i);
+	sim.deliverAll();
+	for (i = 1; i < 4; i++) if (pbftViewOf(sim, i) != 1) return "replicas should be in view 1";
+	return pbftExpectAll(sim);
+}
+
+// f=2: the primaries of views 0 and 1 are both silent; progress resumes in view 2.
+def pbftTwoFaultyPrimaries(opts: TestOptions) -> string {
+	var sim = PbftSim.new(2, 3, opts);
+	sim.faults.deliverPct = 100;
+	sim.makeFaulty(0, PBFT_SILENT, 0).makeFaulty(1, PBFT_SILENT, 0);
+	sim.submit(101).submit(102);
+	var err = pbftRunUntilDone(sim, 2000);
+	if (err != null) return err;
+	if (pbftViewOf(sim, 2) < 2) return "expected at least view 2";
+	return null;
+}
+
+// The primary sends different ops for the same sequence numbers to different
+// replicas. No two ops can be prepared (let alone committed) for one (view, seq),
+// so the replicas either execute consistently or change views.
+def pbftEquivocatingPrimary(opts: TestOptions) -> string {
+	for (seed = 10uL; seed < 20uL; seed++) {
+		var sim = PbftSim.new(1, seed, opts);
+		sim.faults.deliverPct = 70;
+		sim.makeFaulty(0, PBFT_EQUIV, 0);
+		sim.submit(101).submit(102).submit(103);
+		var err = pbftRunUntilDone(sim, 3000);
+		if (err != null) return err;
+	}
+	return null;
+}
+
+// Request op101 is prepared at every replica in view 0, but no Commit is
+// delivered. The primary then goes silent. The new primary must re-propose
+// op101 at s1 in view 1, because the ViewChanges carry its prepared certificate.
+def pbftPreservesPrepared(opts: TestOptions) -> string {
+	var sim = pbftScripted(opts, 1, 4);
+	sim.submit(101);
+	sim.deliverIf(pbftIsPP);			// PrePrepare(v0, s1, op101) -> all
+	sim.deliverIf(pbftNotCommit);			// Prepares -> all; everyone prepared
+	sim.dropIf(pbftIsCommit);			// all Commits lost
+	for (i < 4) if (sim.replica(i).lastExec != 0) return "nothing should be executed yet";
+	sim.makeFaulty(0, PBFT_SILENT, 0);
+	for (i = 1; i < 4; i++) sim.kick(i);
+	sim.deliverAll();
+	var err = pbftExpectAll(sim);
+	if (err != null) return err;
+	var r = sim.replica(1);
+	if (r.view != 1 || r.committedOp[1] != 102) return "op101 should be executed at s1 in view 1";
+	return null;
+}
+
+// N3 is faulty. During a view change it sends a ViewChange whose certificate
+// claims an unsubmitted op9999 was prepared, with forged signatures of honest replicas.
+def pbftForgedRejected(opts: TestOptions) -> string {
+	var err = pbftForged(opts, false);
+	if (err != null) return err;
+	return null;
+}
+// Same scenario, with the bug: replicas skip signature checks inside certificates.
+def pbftForgedAcceptedBug(opts: TestOptions) -> string {
+	var err = pbftForged(opts, true);
+	if (err == null) return "bug was not detected";
+	if (opts.verbose) System.puts(StringBuilder.new().puts("  (detected: ").puts(err).puts(")\n").toString());
+	return null;
+}
+def pbftForged(opts: TestOptions, buggy: bool) -> string {
+	var sim = pbftScripted(opts, 1, 5);
+	if (buggy) sim.config.skipCertSigs = true;
+	sim.makeFaulty(3, PBFT_FORGE, 0);
+	sim.adversary.forgeOp = 9999;
+	sim.submit(101);
+	sim.deliverAll();				// op101 executes normally at s1
+	sim.submit(102);
+	sim.dropIf(pbftIsPP);				// op102's PrePrepare is lost
+	sim.kick(0);					// N0 starts a view change to view 1
+	sim.deliverIf(pbftTo(3, _));			// B3 sees it, broadcasts a forged ViewChange
+	sim.deliverIf(pbftFromTo(3, 1, _));		// the new primary N1 sees the forgery first
+	sim.kick(2);
+	sim.deliverAll();
+	if (!buggy) {
+		for (i < 3) {
+			var vcs = sim.replica(i).vcs[1];
+			if (vcs == null || !vcs.has[3]) continue;
+			for (c in vcs.vcs[3].certs) if (c.pp.op == 9999) return "forged ViewChange was accepted";
+		}
+	}
+	return pbftExpectAll(sim);
+}
+
+// Random lossy networks with one faulty replica that equivocates, forges, and sends garbage.
+def pbftLossy(opts: TestOptions) -> string {
+	for (seed = 100uL; seed < 110uL; seed++) {
+		var sim = PbftSim.new(1, seed, opts);
+		sim.faults.deliverPct = 40;
+		sim.faults.dropPct = 20;
+		sim.faults.dupPct = 10;
+		sim.makeFaulty(int.!(seed % 4), PBFT_EQUIV | PBFT_GARBAGE | PBFT_FORGE, 0);
+		for (i < 4) sim.submit(101 + i);
+		for (r < 200) {
+			if (r % 25 == 24) sim.retransmit();
+			sim.step();
+		}
+		sim.faults.stabilize();
+		var err = pbftRunUntilDone(sim, 5000);
+		if (err != null) return err;
+	}
+	return null;
+}

@@ -1,82 +1,88 @@
-# Paxos in Virgil
+# Consensus protocols in Virgil
 
-Single-decree Paxos with a deterministic network simulator, hand-written
-scenarios, a fuzzer, and an ASCII message-sequence-diagram printer.
+Simulated implementations of four consensus and broadcast protocols, for learning.
+They share one deterministic network simulator, one fuzzer and one ASCII
+message-sequence-diagram printer:
 
-| File | Contents |
-|------|----------|
-| `Paxos.v3` | The protocol: `Msg` ADT, `PaxosNode` (proposer + acceptor + learner), stable vs. volatile state. No simulator dependencies. |
-| `Sim.v3` | Simulator: `Rng`, in-flight `Packet`s, fault injection, crash/restart, `SafetyChecker` oracle, `SimListener`/`TextLog`. |
-| `Diagram.v3` | `Diagram` listener: prints runs as lifeline diagrams. |
-| `Scenarios.v3` | Scripted scenarios (program with its own `main`). |
-| `Fuzz.v3` | Randomized fuzzer (program with its own `main`). |
+| Protocol | Fault model | Directory |
+|----------|-------------|-----------|
+| Paxos (single-decree) | crash faults, asynchronous network | `paxos/` |
+| Raft (election + log replication) | crash faults, asynchronous network | `raft/` |
+| Dolev-Strong (authenticated broadcast) | Byzantine faults (any f < n), synchronous network | `dolevstrong/` |
+| PBFT (normal case + view change) | Byzantine faults (f < n/3), asynchronous network | `pbft/` |
+
+For a guided tour of how each protocol works, illustrated with diagrams from real
+runs, see [EXPLAINER.md](EXPLAINER.md).
 
 ## Building and running
 
 ```sh
-./build.sh            # native binaries in bin/ (needs ~/Code/virgil, or set VIRGIL=...)
-./build.sh test       # build, run all scenarios and 10k fuzz runs
+./build.sh                    # native binaries bin/paxos, bin/raft, bin/dolevstrong, bin/pbft
+./build.sh test               # build, then run every protocol's scenarios and 10k fuzz runs
+./build.sh raft               # build just one
 
-bin/Scenarios                 # run all scenarios
-bin/Scenarios -v preemption   # diagram of scenarios whose name contains "preemption"
-bin/Fuzz -runs=100000         # fuzz
-bin/Fuzz -bug=adopt           # fuzz a deliberately broken protocol; finds violations
-bin/Fuzz -seed=77 -runs=1 -v -bug=adopt   # replay one failing run as a diagram
+bin/paxos scenarios                     # run all scenarios
+bin/paxos scenarios -v preemption       # diagram of scenarios whose name contains "preemption"
+bin/paxos fuzz -runs=100000             # fuzz
+bin/paxos fuzz -bug=adopt               # fuzz a deliberately broken protocol; finds violations
+bin/paxos fuzz -seed=77 -runs=1 -v -bug=adopt   # replay one failing run as a diagram
+bin/paxos                               # usage, including the list of injectable bugs
 
-./run.sh Scenarios -v happy   # same programs, in the interpreter
+./run.sh paxos scenarios -v happy       # same programs, in the interpreter
 ```
 
-## Protocol
+The build script uses the Virgil checkout in `~/Code/virgil`, or `$VIRGIL` if
+it is set. The scenario filter is the last non-flag argument, and it matches
+part of the scenario name, case-sensitively. Quote filters that contain
+spaces. `-trace` prints a plain event log instead of a diagram.
 
-Messages (`type Msg`): `Prepare`, `Promise`, `Accept`, `Accepted`, `Nack`, and
-two outcome-dissemination messages, `Query` and `Decided`. Ballots are
-`round * N + id`, so they are unique per proposer. Acceptors broadcast `Accepted`
-to every node, and a node learns a value when it sees a majority of acceptors
-accept the same ballot.
+## Layout
 
-Nodes never touch the network. `receive()` and `onTimeout()` append to
-`outbox`, and the environment drains it. The environment also decides when
-timers fire, so all the randomness lives in the simulator.
+| File | Contents |
+|------|----------|
+| `core/Node.v3` | `Node<M>`: base class for a protocol node. It has an `outbox` and requests to start or stop timers, and no network or clock. |
+| `core/Sim.v3` | `Rng`, `Packet<M>`, `SimFaults`, `Sim<M>`, `SimListener<M>`, `TextLog<M>`. |
+| `core/Crypto.v3` | Simulated signatures: `Sig`, `KeyRing`, `Signer`, `Digest`. |
+| `core/Diagram.v3` | `Diagram<M>`: prints any simulation as a lifeline diagram. |
+| `core/Driver.v3` | Command-line driver: `TestOptions`, `Scenario`, `Suite`, scenario runner, fuzz loop. |
+| `<protocol>/<Name>.v3` | The protocol itself: its message ADT and node class. |
+| `<protocol>/<Name>Test.v3` | Simulation harness, safety and liveness checker, scenarios, fuzzer, `main`. |
 
-`crashAndRestart()` keeps only `PaxosStable` (the promise, the accepted
-ballot and value, and the proposer's round counter). Everything else is lost.
-`PaxosConfig` can turn off parts of the protocol to inject bugs:
+Each protocol is compiled as its own program: `core/*.v3`, plus its
+directory, plus Virgil's `lib/util`.
 
-| `-bug=` | Bug | Typical detection |
-|---------|-----|-------------------|
-| `acceptor` | acceptor state is not persisted | ~8% of runs |
-| `adopt` | proposer ignores values reported in promises | ~13% of runs |
-| `round` | proposer's ballot round is not persisted (ballot reuse) | rare: 2 in 1M runs |
+## The simulator
 
-## Simulation and checking
+A `Sim<M>` owns the nodes, the messages in flight, and all randomness. Each
+`step()`:
+1. crashes and restarts nodes at random (`crashPct`, `restartPct`);
+2. fires expired timers;
+3. delivers a random subset of in-flight messages (`deliverPct`) in shuffled
+   order.
 
-Each `Sim.step()` crashes and restarts nodes at random, fires retry timers
-that have expired (each timer is reset to a random value in
-`[timeoutMin, timeoutMax]`), and delivers a random subset of in-flight
-messages in shuffled order. A delivered message can be dropped, or duplicated
-so that it stays in flight. Scenarios can also script delivery precisely with
-`deliverIf`, `dropIf`, `kick`, `crash` and `restart`.
+A delivered message can be dropped (`dropPct`), or duplicated so that it also
+stays in flight (`dupPct`). Timers come in kinds (`addTimer(min, max)`), and
+each firing gets a random duration in that range. Nodes can restart or stop
+their own timers. `faults.synchronous()` turns this into a lockstep
+synchronous network: every message is delivered in the next round, and a
+`[1,1]` timer marks round boundaries. Scenarios script events precisely with
+`fire`, `deliverIf`, `dropIf`, `crash` and `restart`.
 
-`SafetyChecker` is an oracle that sees every acceptance. It treats a value as
-chosen once a majority of acceptors accept it in the same ballot, and it
-checks these properties:
+Channels are authenticated, so a packet's `src` is genuine. Signatures
+(`core/Crypto.v3`) are needed for evidence that can be passed on to others,
+such as Dolev-Strong chains and PBFT view-change certificates. A signature's
+tag is a keyed hash under the signer's secret. Only that node's `Signer`, or
+the adversary for a Byzantine node, holds the secret. Anyone can construct a
+`Sig` value, but a forged one fails `KeyRing.verify`.
 
-- no ballot is accepted with two different values
-- only proposed values are accepted
-- at most one value is ever chosen
-- learners only learn the chosen value
-
-Each fuzz run draws a cluster size (1–7), a set of proposers, timer ranges and
-a fault profile from its seed. It runs up to `-chaos` rounds with faults, then
-the network stabilizes: no drops, duplicates or crashes, and every node
-restarts. Within `-bound` rounds after that, every node must decide
-(liveness).
+Every protocol defines injectable bugs (`-bug=NAME`), so you can check that
+the fuzzer and checkers actually catch real mistakes.
 
 ## Diagrams
 
 ```
 round    N0    N1    N2
-legend: X sender, > < receiver, x lost, o timeout, ! crash, + restart, # learn
+legend: X sender, > < receiver, x lost, o timer, ! crash, + restart
 0         o     |     |    N0 timeout: starts a ballot
           X---->|---->|    Prepare(b=3)
           |<----X-----X    Promise(b=3, ab=0, av=0)
@@ -86,4 +92,136 @@ legend: X sender, > < receiver, x lost, o timeout, ! crash, + restart, # learn
 
 In each batch of deliveries, copies of the same message from the same sender
 are drawn as one line. Lines that carry the same message to the same
-receivers are merged. A down node's lifeline is drawn as `:`.
+receivers are merged. A down node's lifeline is drawn as `:`, and Byzantine
+nodes are labeled `B<i>`. Protocols mark their own events on lifelines, for
+example `#` when a node learns a value.
+
+## Paxos
+
+Messages (`type PaxosMsg`): `Prepare`, `Promise`, `Accept`, `Accepted`,
+`Nack`, plus `Query` and `Decided`, which spread the outcome to nodes that
+missed it. Ballots are `round * N + id`. Every node is a proposer, an
+acceptor and a learner. `PaxosStable` holds the state that survives a crash.
+The checker treats a value as chosen once a majority of acceptors accept it
+in the same ballot. It checks that a ballot never has two values, that only
+proposed values are accepted, that at most one value is chosen, and that
+learners learn only the chosen value. Each fuzz run has a chaos phase, then
+the network stabilizes and every node must decide.
+
+| `-bug=` | Bug | Caught in |
+|---------|-----|-----------|
+| `acceptor` | acceptor state is not persisted | 1 in 12 runs |
+| `adopt` | proposer ignores values reported in promises | 1 in 8 runs |
+| `round` | proposer's ballot round is not persisted (ballot reuse) | 2 in 1M runs |
+
+## Raft
+
+Messages (`type RaftMsg`): `RequestVote`, `Vote`, `AppendEntries`,
+`AppendResp`, and `ClientRequest`, which a follower uses to forward a command
+to the leader. `RaftStable` holds the state that survives a crash: the term,
+the vote and the log. There are two timers. The election timer restarts when
+a node hears from the leader or grants a vote, and the heartbeat timer drives
+the leader's AppendEntries. A leader commits only entries from its own term
+(Figure 8). A new leader appends a no-op by default; fuzz runs sometimes turn
+this off, which exposes more bugs. The harness injects client commands with
+`sim.act()`.
+
+The checker enforces these properties:
+- Election Safety: at most one leader per term.
+- Log Matching: checked across every pair of logs, every round.
+- Leader Completeness: a new leader holds every committed entry.
+- State Machine Safety: every node applies the same command at each index, in order.
+
+For liveness, after stabilization every node must apply a newly submitted
+command.
+
+| `-bug=` | Bug | Caught in |
+|---------|-----|-----------|
+| `uptodate` | votes granted without the log up-to-date check | 1 in 16 runs |
+| `truncate` | follower truncates its log even when entries match | 1 in 180 runs |
+| `vote` | `votedFor` is not persisted, so a node can vote twice in a term | 1 in 320 runs |
+| `commit` | leader commits old-term entries by counting replicas (Figure 8) | 6 in 200k runs; always caught by the Figure 8 scenario |
+
+## Dolev-Strong
+
+Authenticated Byzantine broadcast. It tolerates any f < n faulty nodes, in
+f+1 synchronous rounds (`faults.synchronous()`, plus a quiet `[1,1]` timer
+that marks each round). The only message is `Chain(value, sigs)`.
+- A chain delivered in round r is valid if it has at least r signatures, the
+  first signer is the sender, all signers are distinct, and every signature
+  verifies.
+- Signature k signs a digest of the value and signers 0..k-1.
+- A node extracts at most two values, and relays each with its own signature
+  appended.
+- At the start of round f+2, a node outputs its value if it extracted exactly
+  one, and bottom (0) otherwise.
+
+All faulty nodes are controlled by one colluding `DsAdversary`, which holds
+only their keys. Its strategies:
+- silent
+- honest, then crashes
+- equivocating sender and selective relays
+- random garbage
+- forged honest signatures
+- late release: reveal a second value to a single honest node in the last
+  round where its chain is still valid
+
+The checker enforces agreement, validity (if the sender is honest, everyone
+outputs its value) and termination. It also checks that no honest node accepts
+a forged chain.
+
+| `-bug=` | Bug | Caught in |
+|---------|-----|-----------|
+| `nosig` | signatures are not verified | 1 in 4 runs |
+| `rounds` | decide after f rounds instead of f+1 | 1 in 6 runs |
+| `relay` | newly extracted values are not relayed | 1 in 13 runs |
+| `distinct` | signers needn't be distinct, so a chain can be padded | 1 in 100 runs |
+
+## PBFT
+
+The signature-based variant, with n = 3f+1 replicas, the normal case and
+view changes, and no checkpoints. Messages (`type PbftMsg`): `PrePrepare`,
+`Prepare`, `Commit`, `ViewChange` (which carries prepared certificates) and
+`NewView`. There are also `Fetch` and `Proof`, which let a lagging replica
+fetch commit certificates. They stand in for the state transfer that
+checkpoints would provide.
+
+Every message is signed. Certificates are verified against the `KeyRing`, and
+the new primary's proposals are recomputed from the ViewChanges it presents.
+View-change timeouts back off exponentially, and a replica joins a higher view
+once it receives f+1 ViewChanges for it. Honest replicas never crash, but the
+network drops, duplicates and reorders messages during the chaos phase. The
+client retransmits requests that haven't been executed everywhere.
+
+All faulty replicas are controlled by one colluding adversary; the initial
+primary is often faulty. Its strategies:
+- silent, or crash partway through
+- equivocate: send different, validly signed versions of each broadcast,
+  including NewViews whose proposals don't match their ViewChanges
+- random garbage
+- ViewChanges carrying certificates with forged honest signatures
+
+The checker requires that, at every sequence number, honest replicas execute
+the same op, that only submitted ops are executed, and that no op is executed
+twice. For liveness, after stabilization every request must be executed by
+every honest replica, even though the adversary keeps misbehaving.
+
+| `-bug=` | Bug | Caught in |
+|---------|-----|-----------|
+| `prepared` | ViewChanges omit prepared certificates | 1 in 3 runs (mostly as liveness failures) |
+| `quorum` | 2f instead of 2f+1 for commit and new-view quorums | 1 in 38 runs |
+| `nosig` | signatures inside view-change certificates aren't checked | 1 in 56 runs |
+| `newview` | NewView accepted without recomputing its proposals | 1 in 1,260 runs |
+
+## Verification
+
+Fuzz runs of each correct protocol in the final code, all with zero safety
+and zero liveness failures. Times are for the x86-64 binaries running under
+Rosetta on an Apple M4 Pro.
+
+| Protocol | Runs | Time |
+|----------|------|------|
+| Paxos | 200k | 14s |
+| Raft | 100k | 36s |
+| Dolev-Strong | 1M | 12s |
+| PBFT | 50k | 35s |

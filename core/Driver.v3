@@ -1,0 +1,144 @@
+// Shared command-line driver for each protocol's test program.
+//
+// Usage: <protocol> scenarios [-v | -trace] [name-filter]
+//        <protocol> fuzz [-seed=N] [-runs=N] [-chaos=N] [-bound=N] [-bug=NAME] [-v | -trace]
+//
+// Each protocol provides a {Suite} with its scenarios, injectable bugs, and a
+// fuzzer for a single run. Fuzz run i uses seed (N + i); a failing run is
+// reproduced with -seed=<its seed> -runs=1.
+
+// Command-line options, shared by scenarios and fuzzing.
+class TestOptions {
+	var verbose = false;	// print a message sequence diagram
+	var trace = false;	// print a raw event log
+	var seed = 1;
+	var runs = 1000;
+	var chaos = 400;	// max rounds of the fault-injection phase
+	var bound = 3000;	// liveness bound: rounds after stabilization
+	var bug: string;	// name of a deliberately injected protocol bug, or null
+	var filter: string;	// scenario name filter
+
+	// Creates a listener for a simulation, according to the options.
+	def listener<M>() -> SimListener<M> {
+		if (trace) return TextLog<M>.new();
+		if (verbose) return Diagram<M>.new();
+		return SimListener<M>.new();
+	}
+	def hasBug(name: string) -> bool {
+		return bug != null && Strings.equal(bug, name);
+	}
+}
+
+// A named scenario; returns null on success, or an error message.
+type Scenario(name: string, run: TestOptions -> string) #unboxed { }
+
+// The result of one fuzz run.
+class RunResult(error: string, isSafety: bool, config: string, rounds: int, delivered: int) { }
+
+// A protocol's test suite.
+class Suite(name: string, bugs: Array<(string, string)>) {	// bugs: (name, description)
+	def scenarios() -> Array<Scenario>;
+	def fuzzOne(seed: int, opts: TestOptions) -> RunResult;
+}
+
+component Driver {
+	def run(suite: Suite, args: Array<string>) -> int {
+		if (args.length == 0) return usage(suite, null);
+		var opts = TestOptions.new();
+		for (i = 1; i < args.length; i++) {
+			var a = args[i];
+			if (Strings.equal(a, "-v")) opts.verbose = true;
+			else if (Strings.equal(a, "-trace")) opts.trace = opts.verbose = true;
+			else if (Strings.startsWith(a, "-seed=")) opts.seed = intArg(a, 6);
+			else if (Strings.startsWith(a, "-runs=")) opts.runs = intArg(a, 6);
+			else if (Strings.startsWith(a, "-chaos=")) opts.chaos = intArg(a, 7);
+			else if (Strings.startsWith(a, "-bound=")) opts.bound = intArg(a, 7);
+			else if (Strings.startsWith(a, "-bug=")) opts.bug = Arrays.range(a, 5, a.length);
+			else if (a.length > 0 && a[0] == '-') return usage(suite, a);
+			else opts.filter = a;
+		}
+		if (opts.bug != null) {
+			var found = false;
+			for (b in suite.bugs) if (Strings.equal(b.0, opts.bug)) found = true;
+			if (!found) return usage(suite, opts.bug);
+		}
+		var cmd = args[0];
+		if (Strings.equal(cmd, "scenarios")) return runScenarios(suite, opts);
+		if (Strings.equal(cmd, "fuzz")) return runFuzz(suite, opts);
+		return usage(suite, cmd);
+	}
+	def runScenarios(suite: Suite, opts: TestOptions) -> int {
+		var failures = 0, count = 0;
+		for (s in suite.scenarios()) {
+			if (opts.filter != null && !contains(s.name, opts.filter)) continue;
+			count++;
+			System.puts("scenario: ");
+			System.puts(s.name);
+			System.puts(if(opts.verbose, "\n", " ... "));
+			var err = s.run(opts);
+			if (err == null) {
+				System.puts("PASS\n");
+			} else {
+				System.puts("FAIL: ");
+				System.puts(err);
+				System.ln();
+				failures++;
+			}
+		}
+		if (count == 0) System.puts("no scenarios matched\n");
+		else System.puts(if(failures == 0, "all scenarios passed\n", "SOME SCENARIOS FAILED\n"));
+		return if(failures > 0 || count == 0, 1, 0);
+	}
+	def runFuzz(suite: Suite, opts: TestOptions) -> int {
+		var safety = 0, liveness = 0, completed = 0, totalRounds = 0L, totalMsgs = 0L;
+		for (i < opts.runs) {
+			var s = opts.seed + i;
+			var r = suite.fuzzOne(s, opts);
+			completed++;
+			totalRounds += r.rounds;
+			totalMsgs += r.delivered;
+			if (r.error == null) continue;
+			if (r.isSafety) safety++;
+			else liveness++;
+			System.puts(StringBuilder.new()
+				.put3("FAIL seed=%d: %s\n  config: %s\n", s, r.error, r.config)
+				.put2("  reproduce: %s fuzz -seed=%d -runs=1 -v", suite.name, s)
+				.puts(if(opts.bug != null, " -bug=", "")).puts(if(opts.bug != null, opts.bug, ""))
+				.ln().toString());
+			if (safety + liveness >= 10) {
+				System.puts("stopping after 10 failures\n");
+				break;
+			}
+		}
+		System.puts(StringBuilder.new()
+			.put3("%d runs, %d safety violations, %d liveness failures", completed, safety, liveness)
+			.put2(" (%d rounds, %d messages delivered)", totalRounds, totalMsgs)
+			.ln().toString());
+		return if(safety + liveness > 0, 1, 0);
+	}
+	def usage(suite: Suite, arg: string) -> int {
+		var buf = StringBuilder.new();
+		if (arg != null) buf.put1("unknown argument: %s\n", arg);
+		buf.put1("Usage: %s scenarios [-v | -trace] [name-filter]\n", suite.name);
+		buf.put1("       %s fuzz [-seed=N] [-runs=N] [-chaos=N] [-bound=N] [-bug=NAME] [-v | -trace]\n", suite.name);
+		if (suite.bugs.length > 0) {
+			buf.puts("Injectable bugs:\n");
+			for (b in suite.bugs) buf.put2("  -bug=%s: %s\n", b.0, b.1);
+		}
+		System.puts(buf.toString());
+		return 2;
+	}
+	def intArg(a: string, start: int) -> int {
+		var r = Ints.parseDecimal(a, start);
+		if (r.0 <= 0 || start + r.0 != a.length) {
+			System.error("ArgError", StringBuilder.new().put1("invalid number in %s", a).toString());
+		}
+		return r.1;
+	}
+	def contains(s: string, sub: string) -> bool {
+		for (i = 0; i + sub.length <= s.length; i++) {
+			if (Strings.equal(Arrays.range(s, i, i + sub.length), sub)) return true;
+		}
+		return false;
+	}
+}

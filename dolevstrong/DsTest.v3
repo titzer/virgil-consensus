@@ -1,0 +1,547 @@
+// Dolev-Strong simulation harness, Byzantine adversary, checker, scenarios, and fuzzer.
+
+def main(args: Array<string>) -> int {
+	return Driver.run(DsSuite.new("dolevstrong", [
+		("rounds", "decide after f rounds instead of f+1"),
+		("nosig", "don't verify signatures"),
+		("distinct", "don't require distinct signers (chains can be padded)"),
+		("relay", "don't relay newly extracted values")
+	]), args);
+}
+
+def dsRender(keys: KeyRing, m: DsMsg, buf: StringBuilder) -> StringBuilder {
+	return m.render(buf, keys);
+}
+
+// A synchronous simulation of Dolev-Strong with a colluding Byzantine adversary.
+class DsSim extends Sim<DsMsg> {
+	def keys: KeyRing;
+	def f: int;
+	def sender: int;
+	def config = DsConfig.new();
+	var checker: DsChecker;
+	var adversary: DsAdversary;
+
+	new(n: int, seed: u64, keys, f, sender, faulty: Array<bool>, input: int, opts: TestOptions)
+			super(n, seed, dsRender(keys, _, _)) {
+		faults.synchronous();
+		addTimer(1, 1);		// fires at the start of every round
+		setQuiet(0);
+		announceRounds = true;
+		if (opts.hasBug("rounds")) config.extraRound = false;
+		if (opts.hasBug("nosig")) config.checkSigs = false;
+		if (opts.hasBug("distinct")) config.checkDistinct = false;
+		if (opts.hasBug("relay")) config.relay = false;
+		listener = opts.listener<DsMsg>();
+		checker = DsChecker.new(this);
+		adversary = DsAdversary.new(this, faulty);
+		for (i < n) {
+			if (faulty[i]) {
+				byzantine[i] = true;
+				nodes[i] = DsByzNode.new(i, n, adversary);
+			} else {
+				var node = DsNode.new(i, n, sender, f, keys, keys.signer(i), config, checker);
+				node.input = input;
+				nodes[i] = node;
+			}
+		}
+	}
+	def isHonest(i: int) -> bool {
+		return !byzantine[i];
+	}
+	def honest(i: int) -> DsNode {
+		return DsNode.!(nodes[i]);
+	}
+	// Runs the protocol to completion (with a couple of extra rounds), then checks it.
+	def run() -> this {
+		for (r < f + 4) step();
+		checker.finish();
+	}
+	def describeTimer(i: int, kind: int) -> string {
+		return "round";
+	}
+}
+
+// Checks Agreement, Validity, and Termination, and that honest nodes only
+// ever extract values from properly signed chains.
+class DsChecker extends DsObserver {
+	def sim: DsSim;
+	var decisions: Array<int>;
+	var decideRounds: Array<int>;
+	var liveness: string;		// termination failure, null if none
+
+	new(sim) {
+		decisions = Array.new(sim.n);
+		decideRounds = Array.new(sim.n);
+		for (i < sim.n) decisions[i] = -1;
+	}
+
+	def onExtract(node: int, value: int, sigs: Array<Sig>) {
+		var s = sim;
+		if (!(node == s.sender && sigs.length == 0)) {
+			if (sigs.length == 0 || sigs[0].signer != s.sender) {
+				s.fail(StringBuilder.new().put1("N%d extracted a chain not started by the sender", node).toString());
+			} else if (!DsChain.verified(value, sigs, s.keys)) {
+				s.fail(StringBuilder.new().put2("N%d extracted %d from a chain with a forged signature", node, value).toString());
+			} else if (!DsChain.distinct(sigs)) {
+				s.fail(StringBuilder.new().put2("N%d extracted %d from a chain with a repeated signer", node, value).toString());
+			}
+		}
+		s.nodeEvent(node, '*', StringBuilder.new().put1("extracts %d", value).toString());
+	}
+	def onDecide(node: int, value: int) {
+		decisions[node] = value;
+		decideRounds[node] = sim.round;
+		var msg = if(value == 0, "decides bottom", StringBuilder.new().put1("decides %d", value).toString());
+		sim.nodeEvent(node, '#', msg);
+		if (sim.violation == null) checkDecisions();	// report violations as soon as they happen
+	}
+	def finish() {
+		var s = sim;
+		for (i < s.n) {
+			if (!s.isHonest(i)) continue;
+			if (decisions[i] < 0 || decideRounds[i] > s.f + 2) {
+				if (liveness == null) liveness = StringBuilder.new().put2("termination: N%d did not decide by round %d", i, s.f + 2).toString();
+			}
+		}
+		if (s.violation == null) checkDecisions();
+	}
+	// Checks Agreement and Validity among the honest nodes that have decided so far.
+	private def checkDecisions() {
+		var s = sim, first = -1;
+		for (i < s.n) {
+			if (!s.isHonest(i)) continue;
+			var d = decisions[i];
+			if (d < 0) continue;
+			if (first < 0) {
+				first = i;
+			} else if (d != decisions[first]) {
+				s.fail(StringBuilder.new().put3("agreement: N%d decided %d, ", first, decisions[first], i)
+					.put2("N%d decided %d", i, d).toString());
+				return;
+			}
+			if (s.isHonest(s.sender) && d != s.honest(s.sender).input) {
+				s.fail(StringBuilder.new().put3("validity: honest sender N%d sent %d but N%d", s.sender, s.honest(s.sender).input, i)
+					.put1(" decided %d", d).toString());
+				return;
+			}
+		}
+	}
+	def error() -> string {
+		return if(sim.violation != null, sim.violation, liveness);
+	}
+}
+
+// A faulty node: everything it receives goes to the adversary, which decides what it sends.
+class DsByzNode extends Node<DsMsg> {
+	def adversary: DsAdversary;
+
+	new(id: int, n: int, adversary) super(id, n) { }
+
+	def receive(src: int, msg: DsMsg) {
+		adversary.onReceive(id, src, msg);
+	}
+	def onTimer(kind: int) {
+		adversary.onTimer(this);
+	}
+}
+
+enum DsStrategy {
+	SILENT,		// faulty nodes send nothing
+	HONEST,		// behave honestly, then crash (go silent) at {crashRound}
+	EQUIVOCATE,	// faulty sender sends different values to different nodes; selective relays
+	GARBAGE,	// random well-formed chains with random values, signers, and tags
+	FORGE,		// chains claiming honest nodes' signatures, with bogus tags
+	LATE,		// late release: a secret value revealed to one honest node in {releaseRound}
+	MIXED		// a random mix of the above, each round
+}
+
+// One adversary controls all faulty nodes. It holds only their signing keys, sees
+// every message delivered to them, and may send only from them. It acts at the
+// start of each round (the timer phase), so its messages arrive in that round.
+class DsAdversary {
+	def sim: DsSim;
+	def faulty: Array<bool>;
+	var signers: Array<Signer>;		// non-null only for faulty nodes
+	def faultyIds = Vector<int>.new();
+	def honestIds = Vector<int>.new();
+	def known = Vector<(int, Array<Sig>)>.new();	// valid chains seen, one per value
+	def relayed = Vector<(int, int)>.new();		// (faulty node, value) already relayed
+	var queues: Array<Vector<(int, DsMsg)>>;	// per faulty node: (dst, msg) to send this round
+	var planned = -1;
+
+	// Strategy parameters, set by the scenario or fuzzer.
+	var strategy = DsStrategy.SILENT;
+	var valueA = 1;			// the faulty sender's "public" value
+	var valueB = 2;			// the faulty sender's other (equivocated or secret) value
+	var crashRound = 1000;		// HONEST: stop acting from this round on
+	var fixedSplit = false;		// EQUIVOCATE: even honest nodes get A, odd get B, no relays
+	var publicA = true;		// LATE: send A to all honest nodes in round 1
+	var releaseRound = 1;		// LATE: round in which to reveal B
+	var target = -1;		// LATE: honest node to reveal B to
+	var padMode = 0;		// how to lengthen a chain beyond the faulty signers: 0 none, 1 repeat, 2 forge
+
+	new(sim, faulty) {
+		signers = Array.new(sim.n);
+		queues = Array.new(sim.n);
+		for (i < sim.n) {
+			queues[i] = Vector.new();
+			if (faulty[i]) {
+				signers[i] = sim.keys.signer(i);
+				faultyIds.put(i);
+			} else {
+				honestIds.put(i);
+			}
+		}
+	}
+
+	def onReceive(node: int, src: int, msg: DsMsg) {
+		match (msg) {
+			Chain(v, sigs) => {
+				if (v <= 0 || sigs.length == 0 || sigs[0].signer != sim.sender) return;
+				if (!DsChain.distinct(sigs) || !DsChain.verified(v, sigs, sim.keys)) return;
+				for (i < known.length) if (known[i].0 == v) return;
+				known.put((v, sigs));
+			}
+		}
+	}
+	def onTimer(node: DsByzNode) {
+		var r = sim.round;
+		if (planned != r) {
+			planned = r;
+			plan(r);
+		}
+		var q = queues[node.id];
+		for (i < q.length) node.send(q[i].0, q[i].1);
+		q.clear();
+	}
+
+	private def plan(r: int) {
+		if (faultyIds.length == 0) return;
+		match (strategy) {
+			SILENT => ;
+			HONEST => if (r < crashRound) actHonest(r);
+			EQUIVOCATE => actEquivocate(r);
+			GARBAGE => actGarbage(r);
+			FORGE => actForge(r);
+			LATE => actLate(r);
+			MIXED => {
+				var rng = sim.rng;
+				if (rng.chance(40)) actHonest(r);
+				if (rng.chance(30)) actEquivocate(r);
+				if (rng.chance(20)) actGarbage(r);
+				if (rng.chance(20)) actForge(r);
+				if (rng.chance(30)) actLate(r);
+			}
+		}
+	}
+	private def senderFaulty() -> bool {
+		return faulty[sim.sender];
+	}
+	// Relays each known value once from each faulty node, like an honest node.
+	private def actHonest(r: int) {
+		if (r == 1 && senderFaulty()) sendAll(sim.sender, valueA, start(valueA));
+		for (i < known.length) {
+			var k = known[i];
+			for (x < faultyIds.length) {
+				var j = faultyIds[x];
+				if (inChain(k.1, j) || wasRelayed(j, k.0)) continue;
+				relayed.put((j, k.0));
+				sendAll(j, k.0, DsChain.extend(k.0, k.1, signers[j]));
+			}
+		}
+	}
+	private def actEquivocate(r: int) {
+		var rng = sim.rng;
+		if (r == 1 && senderFaulty()) {
+			var a = start(valueA), b = start(valueB);
+			for (d < sim.n) {
+				if (fixedSplit) {
+					queue(sim.sender, d, DsMsg.Chain(if(d % 2 == 0, valueA, valueB), if(d % 2 == 0, a, b)));
+					continue;
+				}
+				var c = rng.range(4);
+				if (c == 0 || c == 2) queue(sim.sender, d, DsMsg.Chain(valueA, a));
+				if (c == 1 || c == 2) queue(sim.sender, d, DsMsg.Chain(valueB, b));
+			}
+			return;
+		}
+		if (fixedSplit) return;
+		// Relay known chains selectively, to random subsets of nodes.
+		for (i < known.length) {
+			var k = known[i];
+			for (x < faultyIds.length) {
+				var j = faultyIds[x];
+				if (inChain(k.1, j) || !rng.chance(50)) continue;
+				var c = DsChain.extend(k.0, k.1, signers[j]);
+				for (d < sim.n) if (rng.chance(50)) queue(j, d, DsMsg.Chain(k.0, c));
+			}
+		}
+	}
+	private def actGarbage(r: int) {
+		var rng = sim.rng, n = sim.n;
+		for (x < faultyIds.length) {
+			var j = faultyIds[x];
+			for (m < rng.range(4)) {
+				var v = rng.between(-1, 5);
+				var sigs = Array<Sig>.new(rng.between(0, n + 1));
+				for (i < sigs.length) {
+					var signer = if(rng.chance(80), rng.range(n), rng.between(-2, n + 2));
+					var digest = if(rng.chance(70), DsChain.digest(v, sigs, i), rng.next());
+					if (signer >= 0 && signer < n && faulty[signer] && rng.chance(60)) {
+						sigs[i] = signers[signer].sign(digest);
+					} else {
+						sigs[i] = Sig(signer, digest, rng.next());
+					}
+				}
+				queue(j, rng.range(n), DsMsg.Chain(v, sigs));
+			}
+		}
+	}
+	private def actForge(r: int) {
+		var rng = sim.rng;
+		var v = rng.between(1, 5);
+		var sigs = start(v);
+		sigs = pad(v, sigs, if(r < 1, 1, r), 2);
+		var j = faultyIds[rng.range(faultyIds.length)];
+		for (x < honestIds.length) {
+			if (rng.chance(60)) queue(j, honestIds[x], DsMsg.Chain(v, sigs));
+		}
+	}
+	private def actLate(r: int) {
+		if (r == 1 && senderFaulty() && publicA) {
+			var a = start(valueA);
+			for (x < honestIds.length) queue(sim.sender, honestIds[x], DsMsg.Chain(valueA, a));
+		}
+		if (r != releaseRound) return;
+		var b = valueB, sigs = start(b);
+		// Lengthen with distinct faulty signers, then pad if still too short.
+		for (x < faultyIds.length) {
+			var j = faultyIds[x];
+			if (sigs.length >= r) break;
+			if (!inChain(sigs, j)) sigs = DsChain.extend(b, sigs, signers[j]);
+		}
+		sigs = pad(b, sigs, r, padMode);
+		var t = target;
+		if (t < 0 || faulty[t]) t = honestIds[sim.rng.range(honestIds.length)];
+		queue(faultyIds[faultyIds.length - 1], t, DsMsg.Chain(b, sigs));
+	}
+	// Lengthens a chain to {len} signatures by repeating a faulty signer (mode 1)
+	// or forging honest signers (mode 2). Mode 0 leaves it as is.
+	private def pad(v: int, sigs: Array<Sig>, len: int, mode: int) -> Array<Sig> {
+		var rng = sim.rng;
+		while (sigs.length < len) {
+			if (mode == 1) {
+				sigs = DsChain.extend(v, sigs, signers[faultyIds[rng.range(faultyIds.length)]]);
+			} else if (mode == 2) {
+				var h = if(honestIds.length > 0, honestIds[rng.range(honestIds.length)], 0);
+				sigs = Arrays.append(Sig(h, DsChain.digest(v, sigs, sigs.length), rng.next()), sigs);
+			} else {
+				break;
+			}
+		}
+		return sigs;
+	}
+	// The first link of a chain for {v}: genuinely signed if the sender is faulty, else forged.
+	private def start(v: int) -> Array<Sig> {
+		var s = sim.sender, d = DsChain.digest(v, [], 0);
+		if (faulty[s]) return [signers[s].sign(d)];
+		return [Sig(s, d, sim.rng.next())];
+	}
+	private def sendAll(j: int, v: int, sigs: Array<Sig>) {
+		var m = DsMsg.Chain(v, sigs);
+		for (d < sim.n) queue(j, d, m);
+	}
+	private def queue(j: int, dst: int, msg: DsMsg) {
+		queues[j].put((dst, msg));
+	}
+	private def inChain(sigs: Array<Sig>, j: int) -> bool {
+		for (s in sigs) if (s.signer == j) return true;
+		return false;
+	}
+	private def wasRelayed(j: int, v: int) -> bool {
+		for (i < relayed.length) if (relayed[i].0 == j && relayed[i].1 == v) return true;
+		return false;
+	}
+}
+
+// Creates a simulation with the given faulty set.
+def dsNewSim(opts: TestOptions, seed: u64, n: int, f: int, sender: int, faultyIds: Array<int>, input: int) -> DsSim {
+	var faulty = Array<bool>.new(n);
+	for (i in faultyIds) faulty[i] = true;
+	var keys = KeyRing.new(n, Rng.new(seed ^ 0x5EED5EEDuL));
+	return DsSim.new(n, seed, keys, f, sender, faulty, input, opts);
+}
+
+// Checks that the run had no violations and every honest node decided {expected}.
+def dsExpect(sim: DsSim, expected: int) -> string {
+	var err = sim.checker.error();
+	if (err != null) return err;
+	for (i < sim.n) {
+		if (!sim.isHonest(i)) continue;
+		var d = sim.checker.decisions[i];
+		if (d != expected) return StringBuilder.new().put3("N%d decided %d, expected %d", i, d, expected).toString();
+	}
+	return null;
+}
+
+// Expects a run with a protocol bug to be caught by the checker.
+def dsExpectViolation(opts: TestOptions, sim: DsSim) -> string {
+	var err = sim.checker.error();
+	if (err == null) return "bug was not detected";
+	if (opts.verbose) System.puts(StringBuilder.new().puts("  (detected: ").puts(err).puts(")\n").toString());
+	return null;
+}
+
+def dsHonestAll(opts: TestOptions) -> string {
+	var sim = dsNewSim(opts, 1, 4, 1, 0, [], 7);
+	return dsExpect(sim.run(), 7);
+}
+
+def dsSilentFaulty(opts: TestOptions) -> string {
+	var sim = dsNewSim(opts, 2, 5, 2, 0, [3, 4], 7);
+	sim.adversary.strategy = DsStrategy.SILENT;
+	return dsExpect(sim.run(), 7);
+}
+
+// The faulty sender sends 1 to even nodes and 2 to odd nodes. Honest nodes
+// relay, so all of them extract both values and output bottom.
+def dsEquivocatingSender(opts: TestOptions) -> string {
+	var sim = dsNewSim(opts, 3, 4, 1, 0, [0], 0);
+	var a = sim.adversary;
+	a.strategy = DsStrategy.EQUIVOCATE;
+	a.fixedSplit = true;
+	return dsExpect(sim.run(), 0);
+}
+
+// Faulty sender N0 and faulty N1 (f = 2) send 1 to everyone, but reveal a
+// chain for 2, signed by both of them, only to N2 at the start of round 2.
+// N2 relays it, so N3 extracts 2 in round 3 = f+1, and both output bottom.
+def dsLateReleaseDefeated(opts: TestOptions) -> string {
+	return dsLateRelease(opts, false);
+}
+// The same attack, but nodes decide after only f rounds: N3 never hears about 2.
+def dsLateReleaseBug(opts: TestOptions) -> string {
+	return dsLateRelease(opts, true);
+}
+def dsLateRelease(opts: TestOptions, buggy: bool) -> string {
+	var sim = dsNewSim(opts, 4, 4, 2, 0, [0, 1], 0);
+	if (buggy) sim.config.extraRound = false;
+	var a = sim.adversary;
+	a.strategy = DsStrategy.LATE;
+	a.releaseRound = 2;
+	a.target = 2;
+	sim.run();
+	if (buggy) return dsExpectViolation(opts, sim);
+	return dsExpect(sim, 0);
+}
+
+// Faulty N3 forges a chain for 9 that claims honest sender N0 and others signed it.
+def dsForgeryRejected(opts: TestOptions) -> string {
+	return dsForgery(opts, false);
+}
+// Without signature checks, the forged chain is accepted.
+def dsForgeryBug(opts: TestOptions) -> string {
+	return dsForgery(opts, true);
+}
+def dsForgery(opts: TestOptions, buggy: bool) -> string {
+	var sim = dsNewSim(opts, 5, 4, 1, 0, [3], 7);
+	if (buggy) sim.config.checkSigs = false;
+	var a = sim.adversary;
+	a.strategy = DsStrategy.FORGE;
+	sim.run();
+	if (buggy) return dsExpectViolation(opts, sim);
+	return dsExpect(sim, 7);
+}
+
+// Faulty sender N0 pads a chain for 2 with its own repeated signature, to make
+// it look old enough to be valid in the last round, and shows it only to N2.
+def dsPaddingRejected(opts: TestOptions) -> string {
+	return dsPadding(opts, false);
+}
+def dsPaddingBug(opts: TestOptions) -> string {
+	return dsPadding(opts, true);
+}
+def dsPadding(opts: TestOptions, buggy: bool) -> string {
+	var sim = dsNewSim(opts, 6, 4, 1, 0, [0], 0);
+	if (buggy) sim.config.checkDistinct = false;
+	var a = sim.adversary;
+	a.strategy = DsStrategy.LATE;
+	a.releaseRound = 2;
+	a.target = 2;
+	a.padMode = 1;
+	sim.run();
+	if (buggy) return dsExpectViolation(opts, sim);
+	return dsExpect(sim, 1);
+}
+
+// n = 5, f = 4: three faulty nodes, including the sender, attempt a late
+// release in round 3 with three genuine signatures. Two honest nodes remain,
+// and the protocol runs 5 rounds, so they still agree.
+def dsMaxFaults(opts: TestOptions) -> string {
+	var sim = dsNewSim(opts, 7, 5, 4, 0, [0, 1, 2], 0);
+	var a = sim.adversary;
+	a.strategy = DsStrategy.LATE;
+	a.releaseRound = 3;
+	a.target = 3;
+	return dsExpect(sim.run(), 0);
+}
+
+class DsSuite extends Suite {
+	new(name: string, bugs: Array<(string, string)>) super(name, bugs) { }
+
+	def scenarios() -> Array<Scenario> {
+		return [
+			Scenario("honest sender, all honest", dsHonestAll),
+			Scenario("honest sender, silent faulty nodes", dsSilentFaulty),
+			Scenario("equivocating faulty sender", dsEquivocatingSender),
+			Scenario("late-release attack defeated by round f+1", dsLateReleaseDefeated),
+			Scenario("BUG(rounds): late release breaks agreement", dsLateReleaseBug),
+			Scenario("forged signature chain rejected", dsForgeryRejected),
+			Scenario("BUG(nosig): forged chain accepted", dsForgeryBug),
+			Scenario("chain padded with repeated signer rejected", dsPaddingRejected),
+			Scenario("BUG(distinct): padded chain accepted", dsPaddingBug),
+			Scenario("f = n-1, late release with 3 faulty nodes", dsMaxFaults)
+		];
+	}
+
+	// Each fuzz run draws n, f, the faulty set, the sender, and an adversary
+	// strategy from its seed, runs the protocol, and checks its properties.
+	def fuzzOne(s: int, opts: TestOptions) -> RunResult {
+		var rng = Rng.new(u64.view(s));
+		var n = rng.between(2, 8);
+		var f = if(rng.chance(40), n - 1, rng.range(n));
+		var k = if(f == 0, 0, if(rng.chance(50), f, rng.range(f + 1)));
+		// Choose k faulty nodes at random.
+		var perm = Array<int>.new(n);
+		for (i < n) perm[i] = i;
+		for (i = n - 1; i > 0; i--) {
+			var j = rng.range(i + 1), t = perm[i];
+			perm[i] = perm[j];
+			perm[j] = t;
+		}
+		var faultyIds = Arrays.range(perm, 0, k);
+		var sender = if(k > 0 && rng.chance(60), perm[rng.range(k)], perm[k + rng.range(n - k)]);
+		var input = rng.between(1, 5);
+		var sim = dsNewSim(opts, rng.next(), n, f, sender, faultyIds, input);
+		var a = sim.adversary;
+		a.strategy = [DsStrategy.SILENT, DsStrategy.HONEST, DsStrategy.EQUIVOCATE, DsStrategy.GARBAGE,
+			DsStrategy.FORGE, DsStrategy.LATE, DsStrategy.MIXED][rng.range(7)];
+		a.valueA = rng.between(1, 5);
+		a.valueB = a.valueA % 5 + 1;
+		a.crashRound = rng.between(1, f + 2);
+		a.publicA = rng.chance(80);
+		var c = rng.range(10);
+		a.releaseRound = if(c < 5 && f > 0, f, if(c < 8, f + 1, rng.between(1, f + 1)));
+		a.padMode = rng.range(3);
+		var config = StringBuilder.new()
+			.put3("n=%d f=%d faulty=%d ", n, f, k)
+			.put3("sender=N%d%s strategy=%s ", sender, if(sim.byzantine[sender], "(faulty)", ""), a.strategy.name)
+			.put3("release=%d pad=%d input=%d", a.releaseRound, a.padMode, input)
+			.toString();
+		if (opts.verbose) System.puts(StringBuilder.new().put2("seed=%d: %s\n", s, config).toString());
+		sim.run();
+		var error = sim.checker.error();
+		return RunResult.new(error, sim.violation != null, config, sim.round, sim.delivered);
+	}
+}

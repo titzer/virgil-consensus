@@ -1,0 +1,354 @@
+// A deterministic, randomized network/node simulator, generic in the message type {M}.
+// Messages are held "in flight" and each round a random subset is delivered,
+// possibly dropped or duplicated. Nodes may crash and restart. Each node has
+// any number of timers (one per "kind"), whose durations are random in a range.
+
+// A small deterministic pseudo-random number generator (xorshift64*).
+class Rng {
+	var state: u64;
+
+	new(seed: u64) {
+		state = seed * 0x9E3779B97F4A7C15uL + 0x2545F4914F6CDD1DuL;
+		if (state == 0) state = 1;
+	}
+	def next() -> u64 {
+		var x = state;
+		x ^= x >> 12;
+		x ^= x << 25;
+		x ^= x >> 27;
+		state = x;
+		return x * 0x2545F4914F6CDD1DuL;
+	}
+	// Returns a number in [0, max).
+	def range(max: int) -> int {
+		if (max <= 1) return 0;
+		return int.view((next() >> 33) % u64.view(max));
+	}
+	// Returns a number in [min, max].
+	def between(min: int, max: int) -> int {
+		return min + range(max - min + 1);
+	}
+	// Returns true with probability {percent}/100.
+	def chance(percent: int) -> bool {
+		return range(100) < percent;
+	}
+}
+
+// A message in flight from {src} to {dst}.
+type Packet<M>(src: int, dst: int, msg: M) { }
+
+// Fault-injection parameters, all as percentages per round (or per message).
+class SimFaults {
+	var deliverPct = 50;	// chance each in-flight message is delivered this round
+	var dropPct = 0;	// chance a delivered message is lost instead
+	var dupPct = 0;		// chance a delivered message also stays in flight
+	var crashPct = 0;	// chance each up node crashes this round
+	var restartPct = 0;	// chance each down node restarts this round
+	var maxInFlight = 2000;	// excess messages are dropped (bounds duplication blowup)
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		return buf.put3("deliver=%d%% drop=%d%% dup=%d%% ", deliverPct, dropPct, dupPct)
+			.put2("crash=%d%% restart=%d%%", crashPct, restartPct);
+	}
+	// Turns off all faults except reordering and delay.
+	def stabilize() {
+		dropPct = 0;
+		dupPct = 0;
+		crashPct = 0;
+		if (deliverPct < 50) deliverPct = 50;
+	}
+	// A synchronous, reliable network: every message is delivered in the next round.
+	def synchronous() {
+		deliverPct = 100;
+		dropPct = 0;
+		dupPct = 0;
+		crashPct = 0;
+		restartPct = 0;
+	}
+}
+
+class Sim<M> {
+	def n: int;
+	def render: (M, StringBuilder) -> StringBuilder;	// renders messages for printing
+	var rng: Rng;
+	def faults = SimFaults.new();
+	var nodes: Array<Node<M>>;
+	var up: Array<bool>;
+	var byzantine: Array<bool>;	// for display and checking; set by the protocol harness
+	var inFlight = Vector<Packet<M>>.new();
+	var round: int;
+	var listener = SimListener<M>.new();	// observes simulation events, e.g. for printing
+	var autoTimers = true;			// fire node timers automatically in {step}
+	var announceRounds = false;		// report "--- round r ---" at the start of each step
+	var violation: string;			// first safety violation reported, null if none
+
+	private var timerMin = Vector<int>.new();
+	private var timerMax = Vector<int>.new();
+	private var timerQuiet = Vector<bool>.new();	// not reported to the listener
+	private var nextFire: Array<Vector<int>>;	// per node, per timer kind; -1 = stopped
+
+	// Statistics.
+	var delivered: int;
+	var dropped: int;
+	var duplicated: int;
+	var crashes: int;
+
+	new(n, seed: u64, render) {
+		rng = Rng.new(seed);
+		nodes = Array.new(n);
+		up = Array.new(n);
+		byzantine = Array.new(n);
+		nextFire = Array.new(n);
+		for (i < n) {
+			up[i] = true;
+			nextFire[i] = Vector.new();
+		}
+	}
+
+	// Defines a timer kind with durations in [min, max] rounds, running on all nodes.
+	def addTimer(min: int, max: int) -> int {
+		var kind = timerMin.length;
+		timerMin.put(min);
+		timerMax.put(max);
+		timerQuiet.put(false);
+		for (i < n) nextFire[i].put(round + rng.between(1, max));
+		return kind;
+	}
+	// Changes the duration range of timer {kind}; affects future restarts only.
+	def setTimer(kind: int, min: int, max: int) -> this {
+		timerMin[kind] = min;
+		timerMax[kind] = max;
+	}
+	// Hides firings of timer {kind} from the listener (e.g. lockstep round ticks).
+	def setQuiet(kind: int) -> this {
+		timerQuiet[kind] = true;
+	}
+	def timerRange(kind: int) -> (int, int) {
+		return (timerMin[kind], timerMax[kind]);
+	}
+	// Immediately fires node {i}'s timer of {kind}.
+	def fire(i: int, kind: int) -> this {
+		if (!up[i]) return;
+		if (!timerQuiet[kind]) listener.onTimer(this, i, kind);
+		nodes[i].onTimer(kind);
+		collect(i);
+	}
+	// Runs {f} on node {i} (if up), e.g. to inject a client request, then sends its output.
+	def act(i: int, f: Node<M> -> void) -> this {
+		if (!up[i]) return;
+		f(nodes[i]);
+		collect(i);
+	}
+	def crash(i: int) -> this {
+		if (!up[i]) return;
+		up[i] = false;
+		crashes++;
+		listener.onCrash(this, i);
+	}
+	def restart(i: int) -> this {
+		if (up[i]) return;
+		up[i] = true;
+		var node = nodes[i];
+		node.outbox.clear();
+		node.timerOps.clear();
+		for (k < timerMin.length) restartTimerOf(i, k);
+		listener.onRestart(this, i);
+		node.onRestart();
+		collect(i);
+	}
+	def restartAll() -> this {
+		for (i < n) restart(i);
+	}
+	// Runs one simulation round: faults, timers, then message delivery.
+	def step() -> this {
+		round++;
+		if (announceRounds) note(StringBuilder.new().put1("--- round %d ---", round).toString());
+		// Crash and restart nodes.
+		for (i < n) {
+			if (up[i]) {
+				if (faults.crashPct > 0 && rng.chance(faults.crashPct)) crash(i);
+			} else {
+				if (faults.restartPct > 0 && rng.chance(faults.restartPct)) restart(i);
+			}
+		}
+		// Fire expired timers.
+		if (autoTimers) {
+			for (i < n) {
+				for (k < timerMin.length) {
+					var t = nextFire[i][k];
+					if (up[i] && t >= 0 && round >= t) {
+						restartTimerOf(i, k);
+						fire(i, k);
+					}
+				}
+			}
+		}
+		// Choose a random subset of in-flight messages to deliver.
+		var batch = Vector<Packet<M>>.new(), keep = Vector<Packet<M>>.new();
+		for (i < inFlight.length) {
+			var p = inFlight[i];
+			if (faults.deliverPct >= 100 || rng.chance(faults.deliverPct)) batch.put(p);
+			else keep.put(p);
+		}
+		inFlight = keep;
+		deliverBatch(batch);
+		listener.onQuiet(this);
+	}
+	// Delivers every in-flight message for which {pred} returns true (no faults).
+	def deliverIf(pred: Packet<M> -> bool) -> this {
+		var batch = Vector<Packet<M>>.new(), keep = Vector<Packet<M>>.new();
+		for (i < inFlight.length) {
+			var p = inFlight[i];
+			if (pred(p)) batch.put(p);
+			else keep.put(p);
+		}
+		inFlight = keep;
+		for (i < batch.length) deliver(batch[i]);
+		listener.onQuiet(this);
+	}
+	// Delivers all in-flight messages, including those generated in response, until quiescent.
+	def deliverAll() -> this {
+		while (inFlight.length > 0) deliverIf(all);
+	}
+	// Drops every in-flight message for which {pred} returns true.
+	def dropIf(pred: Packet<M> -> bool) -> this {
+		var keep = Vector<Packet<M>>.new();
+		for (i < inFlight.length) {
+			var p = inFlight[i];
+			if (pred(p)) {
+				dropped++;
+				listener.onDrop(this, p);
+			} else {
+				keep.put(p);
+			}
+		}
+		inFlight = keep;
+		listener.onQuiet(this);
+	}
+	// Reports a safety violation; the first one is remembered in {violation}.
+	def fail(msg: string) {
+		if (violation == null) violation = msg;
+		listener.onViolation(this, msg);
+	}
+	// Reports a protocol event at node {node}, drawn with {mark} in diagrams.
+	def nodeEvent(node: int, mark: byte, msg: string) {
+		listener.onNodeEvent(this, node, mark, msg);
+	}
+	// Reports a global event or annotation, e.g. "value 10 is chosen".
+	def note(msg: string) {
+		listener.onNote(this, msg);
+	}
+	// Describes what a timer firing means at {node}, for diagrams; protocols override.
+	def describeTimer(node: int, kind: int) -> string {
+		return "timer";
+	}
+	def numUp() -> int {
+		var count = 0;
+		for (b in up) if (b) count++;
+		return count;
+	}
+
+	private def restartTimerOf(i: int, kind: int) {
+		nextFire[i][kind] = round + rng.between(timerMin[kind], timerMax[kind]);
+	}
+	private def deliverBatch(batch: Vector<Packet<M>>) {
+		// Deliver in a random order (Fisher-Yates shuffle).
+		var a = batch.array;
+		for (i = batch.length - 1; i > 0; i--) {
+			var j = rng.range(i + 1);
+			var t = a[i];
+			a[i] = a[j];
+			a[j] = t;
+		}
+		for (i < batch.length) {
+			var p = a[i];
+			if (faults.dropPct > 0 && rng.chance(faults.dropPct)) {
+				dropped++;
+				listener.onDrop(this, p);
+				continue;
+			}
+			if (faults.dupPct > 0 && rng.chance(faults.dupPct)) {
+				duplicated++;
+				inFlight.put(p);
+			}
+			deliver(p);
+		}
+		// Bound the number of in-flight messages by dropping random ones.
+		while (inFlight.length > faults.maxInFlight) {
+			var j = rng.range(inFlight.length);
+			var p = inFlight[j];
+			inFlight[j] = inFlight[inFlight.length - 1];
+			inFlight.resize(inFlight.length - 1);
+			dropped++;
+			listener.onDrop(this, p);
+		}
+	}
+	private def deliver(p: Packet<M>) {
+		if (!up[p.dst]) {
+			dropped++;
+			listener.onDrop(this, p);
+			return;
+		}
+		delivered++;
+		listener.onDeliver(this, p);
+		nodes[p.dst].receive(p.src, p.msg);
+		collect(p.dst);
+	}
+	private def collect(i: int) {
+		var node = nodes[i];
+		var out = node.outbox;
+		for (j < out.length) {
+			var o = out[j];
+			inFlight.put(Packet(i, o.0, o.1));
+		}
+		out.clear();
+		var ops = node.timerOps;
+		for (j < ops.length) {
+			var op = ops[j];
+			if (op.1) restartTimerOf(i, op.0);
+			else nextFire[i][op.0] = -1;
+		}
+		ops.clear();
+	}
+	private def all(p: Packet<M>) -> bool {
+		return true;
+	}
+}
+
+// Receives notifications of simulation events. The default ignores them all.
+class SimListener<M> {
+	def onTimer(sim: Sim<M>, node: int, kind: int) { }
+	def onCrash(sim: Sim<M>, node: int) { }
+	def onRestart(sim: Sim<M>, node: int) { }
+	def onDeliver(sim: Sim<M>, p: Packet<M>) { }
+	def onDrop(sim: Sim<M>, p: Packet<M>) { }
+	def onNodeEvent(sim: Sim<M>, node: int, mark: byte, msg: string) { }
+	def onNote(sim: Sim<M>, msg: string) { }
+	def onViolation(sim: Sim<M>, msg: string) { }
+	// Called after a batch of deliveries, when no more events are immediately pending.
+	def onQuiet(sim: Sim<M>) { }
+}
+
+// Prints every event as a line of text.
+class TextLog<M> extends SimListener<M> {
+	def onTimer(sim: Sim<M>, node: int, kind: int) {
+		line(sim, StringBuilder.new().put2("node %d %s", node, sim.describeTimer(node, kind)));
+	}
+	def onCrash(sim: Sim<M>, node: int) { line(sim, StringBuilder.new().put1("node %d CRASH", node)); }
+	def onRestart(sim: Sim<M>, node: int) { line(sim, StringBuilder.new().put1("node %d RESTART", node)); }
+	def onDeliver(sim: Sim<M>, p: Packet<M>) { line(sim, renderPacket(sim, StringBuilder.new(), p)); }
+	def onDrop(sim: Sim<M>, p: Packet<M>) { line(sim, renderPacket(sim, StringBuilder.new().puts("drop "), p)); }
+	def onNodeEvent(sim: Sim<M>, node: int, mark: byte, msg: string) {
+		line(sim, StringBuilder.new().put2("node %d: %s", node, msg));
+	}
+	def onNote(sim: Sim<M>, msg: string) { line(sim, StringBuilder.new().puts(msg)); }
+	def onViolation(sim: Sim<M>, msg: string) { line(sim, StringBuilder.new().puts("!! SAFETY VIOLATION: ").puts(msg)); }
+
+	def line(sim: Sim<M>, buf: StringBuilder) {
+		System.puts(StringBuilder.new().put1("[%d] ", sim.round).puts(buf.toString()).ln().toString());
+	}
+	def renderPacket(sim: Sim<M>, buf: StringBuilder, p: Packet<M>) -> StringBuilder {
+		buf.put2("%d -> %d: ", p.src, p.dst);
+		return sim.render(p.msg, buf);
+	}
+}

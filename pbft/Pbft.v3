@@ -1,0 +1,579 @@
+// Practical Byzantine Fault Tolerance (Castro & Liskov), signature-based variant.
+//
+// n = 3f+1 replicas tolerate f Byzantine replicas. The primary of view v is
+// replica (v mod n). Normal case: the primary assigns a sequence number to a
+// client request and broadcasts PrePrepare; replicas broadcast Prepare; once a
+// replica has a PrePrepare and 2f matching Prepares from distinct backups it is
+// "prepared" and broadcasts Commit; with 2f+1 matching Commits it has
+// "committed" and executes requests in sequence order.
+//
+// View change: a replica with a pending request starts a timer. On expiry it
+// moves to view v+1 and broadcasts a signed ViewChange carrying its prepared
+// certificates. The new primary collects 2f+1 ViewChanges and broadcasts a
+// NewView, re-proposing (for each sequence number) the op of the highest-view
+// prepared certificate, or a null op. Replicas verify every signature and
+// recompute the proposal set before entering the new view.
+//
+// Every message is signed (core/Crypto.v3); signatures make certificates
+// transferable. There are no checkpoints. Instead, a lagging replica catches up
+// by fetching commit certificates (Fetch / Proof), a simple form of state transfer.
+//
+// Requests are positive ints; op 0 is the null request. Honest replicas never
+// crash in our simulations (all of their state would have to be persistent), so
+// {onRestart} is not used.
+
+// A primary's signed proposal of {op} at sequence number {seq} in {view}.
+type PbftPP(view: int, seq: int, op: int, sig: Sig) { }
+// A signed Prepare or Commit vote; the voter is {sig.signer}.
+type PbftVote(view: int, seq: int, digest: u64, sig: Sig) { }
+// A prepared certificate: a PrePrepare plus 2f matching Prepares from distinct backups.
+type PbftCert(pp: PbftPP, prepares: Array<PbftVote>) { }
+// A signed view change to {newView}, carrying the sender's prepared certificates.
+type PbftVC(newView: int, certs: Array<PbftCert>, sig: Sig) { }
+
+type PbftMsg {
+	case PrePrepare(pp: PbftPP);
+	case Prepare(vote: PbftVote);
+	case Commit(vote: PbftVote);
+	case ViewChange(vc: PbftVC);
+	case NewView(view: int, vcs: Array<PbftVC>, pps: Array<PbftPP>, sig: Sig);
+	// Asks other replicas for commit certificates of sequence numbers >= {fromSeq}.
+	case Fetch(fromSeq: int);
+	// A commit certificate: a PrePrepare plus 2f+1 matching Commits.
+	case Proof(pp: PbftPP, commits: Array<PbftVote>);
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		match (this) {
+			PrePrepare(pp) => PbftFmt.pp(buf.puts("PrePrepare("), pp).puts(")");
+			Prepare(v) => PbftFmt.vote(buf.puts("Prepare("), v).puts(")");
+			Commit(v) => PbftFmt.vote(buf.puts("Commit("), v).puts(")");
+			ViewChange(vc) => PbftFmt.vc(buf, vc);
+			NewView(v, vcs, pps, sig) => {
+				buf.put1("NewView(v=%d, from", v);
+				for (vc in vcs) buf.put1(" %d", vc.sig.signer);
+				buf.puts(", O=[");
+				for (i < pps.length) {
+					if (i > 0) buf.puts(", ");
+					buf.put1("s%d:", pps[i].seq);
+					PbftFmt.op(buf, pps[i].op);
+				}
+				buf.puts("])");
+			}
+			Fetch(s) => buf.put1("Fetch(from s=%d)", s);
+			Proof(pp, commits) => PbftFmt.pp(buf.puts("Proof("), pp).put1(", %d commits)", commits.length);
+		}
+		return buf;
+	}
+}
+
+// Formatting of message parts.
+component PbftFmt {
+	def op(buf: StringBuilder, op: int) -> StringBuilder {
+		return if(op == 0, buf.puts("null"), buf.put1("op%d", op));
+	}
+	def pp(buf: StringBuilder, pp: PbftPP) -> StringBuilder {
+		buf.put2("v=%d, s=%d, ", pp.view, pp.seq);
+		return PbftFmt.op(buf, pp.op);
+	}
+	def vote(buf: StringBuilder, v: PbftVote) -> StringBuilder {
+		buf.put2("v=%d, s=%d, d=", v.view, v.seq);
+		var op = PbftDigest.opOf(v.digest);
+		if (op < 0) return buf.puts("?");
+		return PbftFmt.op(buf, op);
+	}
+	def vc(buf: StringBuilder, vc: PbftVC) -> StringBuilder {
+		buf.put1("ViewChange(v=%d, prepared=[", vc.newView);
+		for (i < vc.certs.length) {
+			var pp = vc.certs[i].pp;
+			if (i > 0) buf.puts(", ");
+			buf.put1("s%d:", pp.seq);
+			PbftFmt.op(buf, pp.op).put1("@v%d", pp.view);
+		}
+		return buf.puts("])");
+	}
+}
+
+// Digests of the signed contents of each message kind.
+component PbftDigest {
+	def PP = 1;
+	def PREPARE = 2;
+	def COMMIT = 3;
+	def VC = 4;
+	def NV = 5;
+	// Remembers which op each request digest came from, for printing only.
+	private def ops = HashMap<u64, int>.new(hashU64, u64.==);
+
+	def op(op: int) -> u64 {
+		var d = Digest.new().add(0).add(op).get();
+		ops[d] = op + 1;
+		return d;
+	}
+	// Returns the op with digest {d}, or -1 if unknown.
+	def opOf(d: u64) -> int {
+		return ops[d] - 1;
+	}
+	def pp(view: int, seq: int, op: int) -> u64 {
+		return Digest.new().add(PP).add(view).add(seq).add(op).get();
+	}
+	def vote(kind: int, view: int, seq: int, digest: u64) -> u64 {
+		return Digest.new().add(kind).add(view).add(seq).addL(digest).get();
+	}
+	def vc(newView: int, certs: Array<PbftCert>) -> u64 {
+		var d = Digest.new().add(VC).add(newView);
+		for (c in certs) {
+			d.add(c.pp.view).add(c.pp.seq).add(c.pp.op).addL(c.pp.sig.tag);
+			for (p in c.prepares) d.add(p.sig.signer).addL(p.sig.tag);
+		}
+		return d.get();
+	}
+	def nv(view: int, vcs: Array<PbftVC>, pps: Array<PbftPP>) -> u64 {
+		var d = Digest.new().add(NV).add(view);
+		for (vc in vcs) d.add(vc.sig.signer).addL(vc.sig.tag);
+		for (pp in pps) d.add(pp.seq).add(pp.op).addL(pp.sig.tag);
+		return d.get();
+	}
+}
+
+def hashU64(x: u64) -> int {
+	return int.view(x ^ (x >> 32));
+}
+def hashLong(x: long) -> int {
+	return int.view(x ^ (x >> 32));
+}
+
+// Callbacks that let an environment observe execution (e.g. for checking).
+class PbftObserver {
+	// Replica {replica} executed {op} at {seq}; {dup} if it had already executed {op} earlier.
+	def onExecute(replica: int, seq: int, op: int, dup: bool) { }
+	def onViewChange(replica: int, view: int) { }
+	def onNewView(replica: int, view: int) { }
+}
+
+// Configuration knobs; the defaults are the correct protocol.
+class PbftConfig {
+	var weakQuorum = false;		// use 2f instead of 2f+1 for commit and new-view quorums
+	var skipCertSigs = false;	// don't verify signatures inside view-change certificates
+	var trustNewView = false;	// don't recompute/validate the NewView's proposals
+	var omitPrepared = false;	// ViewChange messages carry no prepared certificates
+}
+
+// Lets a Byzantine adversary intercept a replica's inputs and outputs.
+// The default passes everything through unchanged.
+class PbftHook {
+	// Returns false to ignore {msg} instead of processing it honestly.
+	def onReceive(r: PbftReplica, src: int, msg: PbftMsg) -> bool { return true; }
+	def onTimer(r: PbftReplica) -> bool { return true; }
+	def onRequest(r: PbftReplica, op: int) -> bool { return true; }
+	// Sends {msg} to every replica; may substitute different messages.
+	def broadcast(r: PbftReplica, msg: PbftMsg) { r.broadcast(msg); }
+}
+
+// The ViewChanges received for one view, at most one per replica.
+class PbftVCSet(n: int) {
+	def vcs = Array<PbftVC>.new(n);
+	def has = Array<bool>.new(n);
+	var count: int;
+
+	def add(src: int, vc: PbftVC) {
+		if (has[src]) return;
+		has[src] = true;
+		vcs[src] = vc;
+		count++;
+	}
+}
+
+// Per (view, seq) state: the PrePrepare and votes received.
+class PbftEntry(view: int, seq: int, n: int) {
+	var hasPP: bool;
+	var pp: PbftPP;
+	var digest: u64;
+	def prepares = Array<PbftVote>.new(n);
+	def hasPrepare = Array<bool>.new(n);
+	def commits = Array<PbftVote>.new(n);
+	def hasCommit = Array<bool>.new(n);
+	var prepared: bool;
+	var committed: bool;
+}
+
+class PbftReplica extends Node<PbftMsg> {
+	def VIEWCHANGE = 0;	// the view-change timer kind
+	def f: int;
+	def config: PbftConfig;
+	def keys: KeyRing;
+	def signer: Signer;
+	def observer: PbftObserver;
+	var hook = PbftHook.new();
+
+	var view: int;
+	var active = true;			// false while changing to {view}
+	def log = HashMap<long, PbftEntry>.new(hashLong, long.==);
+	def bestCert = HashMap<int, PbftCert>.new(int.!<int>, int.==);	// seq -> highest-view prepared cert
+	var maxCertSeq: int;
+	def vcs = HashMap<int, PbftVCSet>.new(int.!<int>, int.==);	// view -> ViewChanges received
+	var myVC: PbftMsg;			// our latest ViewChange, for retransmission
+	def sentVCs = HashMap<int, PbftMsg>.new(int.!<int>, int.==);	// view -> our ViewChange
+	var lastNV: PbftMsg;			// the NewView we sent as primary, for retransmission
+	var hasNV = false;
+	var sentNewView = -1;
+	def futurePPs = Vector<PbftPP>.new();	// PrePrepares for a view we have not entered yet
+	def committedOp = HashMap<int, int>.new(int.!<int>, int.==);	// seq -> op + 1
+	def proofs = HashMap<int, PbftMsg>.new(int.!<int>, int.==);	// seq -> commit certificate
+	var lastExec: int;
+	def executed = HashMap<int, bool>.new(int.!<int>, int.==);
+	def known = HashMap<int, bool>.new(int.!<int>, int.==);
+	def pending = Vector<int>.new();
+	var assigned = HashMap<int, bool>.new(int.!<int>, int.==);
+	var nextSeq = 1;
+	var backoff = 1;			// timer expiries to wait before escalating a view change
+	var waits = 0;
+
+	new(id: int, n: int, f, config, keys, signer, observer) super(id, n) { }
+
+	def primary(v: int) -> int {
+		return v % n;
+	}
+	// Quorum for commits, new views, and commit certificates.
+	def quorum() -> int {
+		return if(config.weakQuorum, 2 * f, 2 * f + 1);
+	}
+
+	// A client request arrives.
+	def request(op: int) {
+		if (!hook.onRequest(this, op)) return;
+		if (op <= 0 || executed[op]) return;
+		if (!known[op]) {
+			known[op] = true;
+			pending.put(op);
+			if (pending.length == 1) restartTimer(VIEWCHANGE);
+		}
+		if (active && primary(view) == id) assignPending();
+	}
+	def onTimer(kind: int) {
+		if (!hook.onTimer(this)) return;
+		if (active) {
+			if (pending.length == 0) {
+				stopTimer(VIEWCHANGE);
+				return;
+			}
+			out(PbftMsg.Fetch(lastExec + 1));
+			startViewChange(view + 1);
+			return;
+		}
+		// Still changing views: escalate only once 2f+1 replicas agree the
+		// view change is underway (so a lone replica can't race ahead);
+		// otherwise retransmit our ViewChange.
+		out(PbftMsg.Fetch(lastExec + 1));
+		if (++waits >= backoff && countVCs(view) >= quorum()) {
+			if (backoff < 8) backoff = backoff * 2;
+			startViewChange(view + 1);
+		} else {
+			out(myVC);
+		}
+	}
+	def receive(src: int, msg: PbftMsg) {
+		if (!hook.onReceive(this, src, msg)) return;
+		match (msg) {
+			PrePrepare(pp) => {
+				if (src != primary(pp.view) || !validPP(pp)) return;
+				if (pp.view > view || (pp.view == view && !active)) futurePPs.put(pp);
+				else if (pp.view == view && (pp.op == 0 || known[pp.op])) acceptPP(pp);
+			}
+			Prepare(v) => {
+				if (v.sig.signer != src || !validVote(PbftDigest.PREPARE, v)) return;
+				var e = entry(v.view, v.seq);
+				if (e.hasPrepare[src]) return;
+				e.hasPrepare[src] = true;
+				e.prepares[src] = v;
+				check(e);
+			}
+			Commit(v) => {
+				if (v.sig.signer != src || !validVote(PbftDigest.COMMIT, v)) return;
+				var e = entry(v.view, v.seq);
+				if (e.hasCommit[src]) return;
+				e.hasCommit[src] = true;
+				e.commits[src] = v;
+				check(e);
+			}
+			ViewChange(vc) => {
+				if (vc.sig.signer != src || !validVC(vc)) return;
+				onViewChange(src, vc);
+			}
+			NewView(v, nvcs, pps, sig) => {
+				if (src != primary(v) || !keys.verifyBy(sig, src, PbftDigest.nv(v, nvcs, pps))) return;
+				onNewView(v, nvcs, pps);
+			}
+			Fetch(from) => {
+				for (s = from; s <= lastExec && s < from + 8; s++) {
+					if (proofs.has(s)) send(src, proofs[s]);
+				}
+			}
+			Proof(pp, commits) => {
+				if (validProof(pp, commits)) commit(pp.seq, pp.op, msg);
+			}
+		}
+	}
+
+	// The primary assigns sequence numbers to pending, unassigned requests.
+	private def assignPending() {
+		for (i < pending.length) {
+			var op = pending[i];
+			if (assigned[op] || executed[op]) continue;
+			assigned[op] = true;
+			var seq = nextSeq++;
+			out(PbftMsg.PrePrepare(PbftPP(view, seq, op, signer.sign(PbftDigest.pp(view, seq, op)))));
+		}
+	}
+	private def acceptPP(pp: PbftPP) {
+		var e = entry(pp.view, pp.seq);
+		if (e.hasPP) return;	// at most one PrePrepare per (view, seq)
+		e.hasPP = true;
+		e.pp = pp;
+		e.digest = PbftDigest.op(pp.op);
+		if (id != primary(pp.view)) {
+			out(PbftMsg.Prepare(vote(PbftDigest.PREPARE, pp.view, pp.seq, e.digest)));
+		}
+		check(e);
+	}
+	private def check(e: PbftEntry) {
+		if (!e.hasPP) return;
+		if (!e.prepared) {
+			var votes = Vector<PbftVote>.new();
+			for (i < n) {
+				if (e.hasPrepare[i] && i != primary(e.view) && e.prepares[i].digest == e.digest) votes.put(e.prepares[i]);
+			}
+			if (votes.length < 2 * f) return;
+			e.prepared = true;
+			var cert = PbftCert(e.pp, votes.extract());
+			if (!bestCert.has(e.seq) || bestCert[e.seq].pp.view < e.view) bestCert[e.seq] = cert;
+			if (e.seq > maxCertSeq) maxCertSeq = e.seq;
+			if (active && e.view == view) out(PbftMsg.Commit(vote(PbftDigest.COMMIT, e.view, e.seq, e.digest)));
+		}
+		if (!e.committed) {
+			var votes = Vector<PbftVote>.new();
+			for (i < n) {
+				if (e.hasCommit[i] && e.commits[i].digest == e.digest) votes.put(e.commits[i]);
+			}
+			if (votes.length < quorum()) return;
+			e.committed = true;
+			commit(e.seq, e.pp.op, PbftMsg.Proof(e.pp, votes.extract()));
+		}
+	}
+	private def commit(seq: int, op: int, proof: PbftMsg) {
+		if (committedOp[seq] != 0) return;
+		committedOp[seq] = op + 1;
+		proofs[seq] = proof;
+		var progress = false;
+		while (committedOp[lastExec + 1] != 0) {
+			var s = ++lastExec, x = committedOp[s] - 1;
+			var dup = x != 0 && executed[x];
+			if (x != 0 && !dup) {
+				executed[x] = true;
+				removePending(x);
+			}
+			observer.onExecute(id, s, x, dup);
+			progress = true;
+		}
+		if (progress) {
+			backoff = 1;
+			if (pending.length == 0) stopTimer(VIEWCHANGE);
+			else restartTimer(VIEWCHANGE);
+		}
+	}
+	private def removePending(op: int) {
+		var j = 0;
+		for (i < pending.length) {
+			if (pending[i] != op) pending[j++] = pending[i];
+		}
+		pending.resize(j);
+	}
+	private def startViewChange(v: int) {
+		view = v;
+		active = false;
+		waits = 0;
+		futurePPs.clear();
+		var certs = Vector<PbftCert>.new();
+		if (!config.omitPrepared) {
+			for (s = 1; s <= maxCertSeq; s++) {
+				if (bestCert.has(s)) certs.put(bestCert[s]);
+			}
+		}
+		var a = certs.extract();
+		myVC = PbftMsg.ViewChange(PbftVC(v, a, signer.sign(PbftDigest.vc(v, a))));
+		sentVCs[v] = myVC;
+		restartTimer(VIEWCHANGE);
+		observer.onViewChange(id, v);
+		out(myVC);
+	}
+	private def countVCs(v: int) -> int {
+		var a = vcs[v];
+		return if(a == null, 0, a.count);
+	}
+	private def onViewChange(src: int, vc: PbftVC) {
+		var v = vc.newView;
+		if (active && v == view && sentNewView == view && hasNV) {
+			send(src, lastNV);	// a lagging replica missed our NewView
+			return;
+		}
+		if (v < view) {
+			// The sender is behind, perhaps because our messages were lost.
+			// Retransmit what we said about its view, and where we are now.
+			if (sentVCs.has(v)) send(src, sentVCs[v]);
+			if (!active) send(src, myVC);
+			return;
+		}
+		if (v == view && active) return;
+		var a = vcs[v];
+		if (a == null) vcs[v] = a = PbftVCSet.new(n);
+		a.add(src, vc);
+		// Join a view change that f+1 replicas have started: at least one is honest.
+		var senders = Array<bool>.new(n), count = 0, minView = int.max;
+		var w = view + 1;
+		for (u = w; u <= w + 2 * n; u++) {
+			var b = vcs[u];
+			if (b == null) continue;
+			for (i < n) {
+				if (b.has[i] && !senders[i]) {
+					senders[i] = true;
+					count++;
+					if (u < minView) minView = u;
+				}
+			}
+		}
+		if (count >= f + 1 && minView != int.max) startViewChange(minView);
+		// As the new primary, announce the view once 2f+1 replicas agree.
+		if (!active && primary(view) == id && sentNewView < view && countVCs(view) >= quorum()) {
+			sendNewView(view);
+		}
+	}
+	private def sendNewView(v: int) {
+		var chosen = Vector<PbftVC>.new(), a = vcs[v];
+		for (i < n) if (a.has[i] && chosen.length < quorum()) chosen.put(a.vcs[i]);
+		var nvcs = chosen.extract();
+		var ops = computeO(nvcs);
+		var pps = Array<PbftPP>.new(ops.length);
+		for (i < ops.length) {
+			var seq = i + 1;
+			pps[i] = PbftPP(v, seq, ops[i], signer.sign(PbftDigest.pp(v, seq, ops[i])));
+		}
+		sentNewView = v;
+		lastNV = PbftMsg.NewView(v, nvcs, pps, signer.sign(PbftDigest.nv(v, nvcs, pps)));
+		hasNV = true;
+		out(lastNV);
+	}
+	// For each sequence number up to the highest prepared one, the op of the
+	// highest-view prepared certificate in the ViewChanges, or the null op.
+	def computeO(nvcs: Array<PbftVC>) -> Array<int> {
+		var max = 0;
+		for (vc in nvcs) for (c in vc.certs) if (c.pp.seq > max) max = c.pp.seq;
+		var ops = Array<int>.new(max), views = Array<int>.new(max);
+		for (i < max) views[i] = -1;
+		for (vc in nvcs) {
+			for (c in vc.certs) {
+				var i = c.pp.seq - 1;
+				if (c.pp.view > views[i]) {
+					views[i] = c.pp.view;
+					ops[i] = c.pp.op;
+				}
+			}
+		}
+		return ops;
+	}
+	private def onNewView(v: int, nvcs: Array<PbftVC>, pps: Array<PbftPP>) {
+		if (v < view || (v == view && active)) return;
+		var signers = Array<bool>.new(n), count = 0;
+		for (vc in nvcs) {
+			if (vc.newView != v || !validVC(vc)) return;
+			var s = vc.sig.signer;
+			if (!signers[s]) count++;
+			signers[s] = true;
+		}
+		if (count < quorum()) return;
+		for (i < pps.length) {
+			var pp = pps[i];
+			if (pp.view != v || !keys.verifyBy(pp.sig, primary(v), PbftDigest.pp(v, pp.seq, pp.op))) return;
+		}
+		if (!config.trustNewView) {
+			var ops = computeO(nvcs);
+			if (ops.length != pps.length) return;
+			for (i < ops.length) if (pps[i].seq != i + 1 || pps[i].op != ops[i]) return;
+		}
+		enterView(v, pps);
+	}
+	private def enterView(v: int, pps: Array<PbftPP>) {
+		view = v;
+		active = true;
+		waits = 0;
+		assigned = HashMap.new(int.!<int>, int.==);
+		nextSeq = 1;
+		observer.onNewView(id, v);
+		for (pp in pps) {
+			if (pp.op != 0) assigned[pp.op] = true;
+			if (pp.seq >= nextSeq) nextSeq = pp.seq + 1;
+			acceptPP(pp);
+		}
+		for (i < futurePPs.length) {
+			var pp = futurePPs[i];
+			if (pp.view == v && (pp.op == 0 || known[pp.op])) acceptPP(pp);
+		}
+		futurePPs.clear();
+		if (primary(v) == id) assignPending();
+		if (pending.length > 0) restartTimer(VIEWCHANGE);
+		else stopTimer(VIEWCHANGE);
+	}
+
+	// Validation of signed messages and certificates.
+	def validPP(pp: PbftPP) -> bool {
+		return pp.seq >= 1 && pp.view >= 0 && pp.op >= 0
+			&& keys.verifyBy(pp.sig, primary(pp.view), PbftDigest.pp(pp.view, pp.seq, pp.op));
+	}
+	def validVote(kind: int, v: PbftVote) -> bool {
+		return keys.verifyBy(v.sig, v.sig.signer, PbftDigest.vote(kind, v.view, v.seq, v.digest));
+	}
+	def validVC(vc: PbftVC) -> bool {
+		if (!keys.verifyBy(vc.sig, vc.sig.signer, PbftDigest.vc(vc.newView, vc.certs))) return false;
+		for (c in vc.certs) if (!validCert(c, vc.newView)) return false;
+		return true;
+	}
+	def validCert(c: PbftCert, newView: int) -> bool {
+		var pp = c.pp, sigs = !config.skipCertSigs;
+		if (pp.view >= newView || pp.seq < 1 || pp.op < 0) return false;
+		if (sigs && !validPP(pp)) return false;
+		var d = PbftDigest.op(pp.op), voters = Array<bool>.new(n), count = 0;
+		for (p in c.prepares) {
+			var s = p.sig.signer;
+			if (s < 0 || s >= n || s == primary(pp.view) || voters[s]) continue;
+			if (p.view != pp.view || p.seq != pp.seq || p.digest != d) continue;
+			if (sigs && !validVote(PbftDigest.PREPARE, p)) continue;
+			voters[s] = true;
+			count++;
+		}
+		return count >= 2 * f;
+	}
+	def validProof(pp: PbftPP, commits: Array<PbftVote>) -> bool {
+		if (!validPP(pp)) return false;
+		var d = PbftDigest.op(pp.op), voters = Array<bool>.new(n), count = 0;
+		for (c in commits) {
+			var s = c.sig.signer;
+			if (s < 0 || s >= n || voters[s]) continue;
+			if (c.view != pp.view || c.seq != pp.seq || c.digest != d) continue;
+			if (!validVote(PbftDigest.COMMIT, c)) continue;
+			voters[s] = true;
+			count++;
+		}
+		return count >= quorum();
+	}
+
+	def vote(kind: int, view: int, seq: int, digest: u64) -> PbftVote {
+		return PbftVote(view, seq, digest, signer.sign(PbftDigest.vote(kind, view, seq, digest)));
+	}
+	def entry(view: int, seq: int) -> PbftEntry {
+		var key = (long.!(view) << 32) | long.!(seq);
+		var e = log[key];
+		if (e == null) log[key] = e = PbftEntry.new(view, seq, n);
+		return e;
+	}
+	// All protocol broadcasts go through the hook, so an adversary can tamper with them.
+	private def out(msg: PbftMsg) {
+		hook.broadcast(this, msg);
+	}
+}

@@ -1,16 +1,14 @@
 // Single-decree Paxos (the "Synod" protocol).
 //
 // Every node plays all three roles: proposer, acceptor, and learner.
-// Nodes never touch a network directly; handling a message (or a timer
-// firing) appends outgoing messages to the node's {outbox}, which the
-// environment (e.g. a simulator) drains and delivers however it likes.
+// Like all {Node}s, a PaxosNode never touches a network or clock directly.
 //
 // Values are positive integers; 0 means "no value".
 // Ballots are positive integers, unique per proposer: ballot = round * N + id.
 // Ballot 0 means "no ballot".
 
 // The message kinds exchanged between nodes.
-type Msg {
+type PaxosMsg {
 	// Phase 1a: proposer asks acceptors to promise not to accept ballots < {ballot}.
 	case Prepare(ballot: int);
 	// Phase 1b: acceptor promises, reporting the last ballot/value it accepted (if any).
@@ -40,9 +38,6 @@ type Msg {
 	}
 }
 
-// An outgoing message, addressed to node {dst}.
-type Outgoing(dst: int, msg: Msg) #unboxed { }
-
 // Callbacks that let an environment observe protocol-level events (e.g. for checking).
 class PaxosObserver {
 	def onAccepted(node: int, ballot: int, value: int) { }
@@ -67,8 +62,9 @@ class PaxosStable {
 
 private enum Phase { IDLE, PREPARE, ACCEPT }
 
-class PaxosNode(id: int, n: int, config: PaxosConfig, observer: PaxosObserver) {
-	def outbox = Vector<Outgoing>.new();
+class PaxosNode extends Node<PaxosMsg> {
+	def config: PaxosConfig;
+	def observer: PaxosObserver;
 	var stable = PaxosStable.new();
 
 	// Proposer state (volatile).
@@ -86,7 +82,7 @@ class PaxosNode(id: int, n: int, config: PaxosConfig, observer: PaxosObserver) {
 	private var learnBallot: Array<int>;	// per acceptor: highest Accepted ballot seen
 	private var learnValue: Array<int>;	// per acceptor: value of that ballot
 
-	new() {
+	new(id: int, n: int, config, observer) super(id, n) {
 		reset();
 	}
 
@@ -94,7 +90,7 @@ class PaxosNode(id: int, n: int, config: PaxosConfig, observer: PaxosObserver) {
 		return n / 2 + 1;
 	}
 	// Discards all volatile state, as if the node had crashed and restarted.
-	def crashAndRestart() {
+	def onRestart() {
 		var s = stable;
 		stable = PaxosStable.new();
 		if (config.persistAcceptor) {
@@ -103,7 +99,6 @@ class PaxosNode(id: int, n: int, config: PaxosConfig, observer: PaxosObserver) {
 			stable.acceptedValue = s.acceptedValue;
 		}
 		if (config.persistRound) stable.round = s.round;
-		outbox.clear();
 		reset();
 	}
 	private def reset() {
@@ -124,10 +119,10 @@ class PaxosNode(id: int, n: int, config: PaxosConfig, observer: PaxosObserver) {
 	}
 	// Called by the environment when this node's retry timer fires.
 	// Starts a new ballot if this node has a proposal, or asks for the outcome otherwise.
-	def onTimeout() {
+	def onTimer(kind: int) {
 		if (decided != 0) return;
 		if (proposal == 0) {
-			broadcast(Msg.Query);
+			broadcast(PaxosMsg.Query);
 			return;
 		}
 		var r = stable.round + 1, seenRound = maxSeen / n + 1;
@@ -139,23 +134,23 @@ class PaxosNode(id: int, n: int, config: PaxosConfig, observer: PaxosObserver) {
 		numPromises = 0;
 		bestBallot = 0;
 		bestValue = 0;
-		broadcast(Msg.Prepare(ballot));
+		broadcast(PaxosMsg.Prepare(ballot));
 	}
 	// Handles a message from node {src}.
-	def receive(src: int, msg: Msg) {
+	def receive(src: int, msg: PaxosMsg) {
 		match (msg) {
 			Prepare(b) => {
 				see(b);
 				if (decided != 0) {
-					send(src, Msg.Decided(decided));
+					send(src, PaxosMsg.Decided(decided));
 					return;
 				}
 				var s = stable;
 				if (b >= s.promised) {
 					s.promised = b;
-					send(src, Msg.Promise(b, s.acceptedBallot, s.acceptedValue));
+					send(src, PaxosMsg.Promise(b, s.acceptedBallot, s.acceptedValue));
 				} else {
-					send(src, Msg.Nack(b, s.promised));
+					send(src, PaxosMsg.Nack(b, s.promised));
 				}
 			}
 			Promise(b, ab, av) => {
@@ -169,7 +164,7 @@ class PaxosNode(id: int, n: int, config: PaxosConfig, observer: PaxosObserver) {
 				if (numPromises >= majority()) {
 					phase = Phase.ACCEPT;
 					var v = if(bestBallot > 0 && config.adoptAccepted, bestValue, proposal);
-					broadcast(Msg.Accept(ballot, v));
+					broadcast(PaxosMsg.Accept(ballot, v));
 				}
 			}
 			Accept(b, v) => {
@@ -180,9 +175,9 @@ class PaxosNode(id: int, n: int, config: PaxosConfig, observer: PaxosObserver) {
 					s.acceptedBallot = b;
 					s.acceptedValue = v;
 					observer.onAccepted(id, b, v);
-					broadcast(Msg.Accepted(b, v));
+					broadcast(PaxosMsg.Accepted(b, v));
 				} else {
-					send(src, Msg.Nack(b, s.promised));
+					send(src, PaxosMsg.Nack(b, s.promised));
 				}
 			}
 			Accepted(b, v) => {
@@ -199,7 +194,7 @@ class PaxosNode(id: int, n: int, config: PaxosConfig, observer: PaxosObserver) {
 				if (b == ballot) phase = Phase.IDLE; // give up; retry on next timeout
 			}
 			Query => {
-				if (decided != 0) send(src, Msg.Decided(decided));
+				if (decided != 0) send(src, PaxosMsg.Decided(decided));
 			}
 			Decided(v) => learn(v);
 		}
@@ -212,11 +207,5 @@ class PaxosNode(id: int, n: int, config: PaxosConfig, observer: PaxosObserver) {
 	}
 	private def see(b: int) {
 		if (b > maxSeen) maxSeen = b;
-	}
-	private def send(dst: int, msg: Msg) {
-		outbox.put(Outgoing(dst, msg));
-	}
-	private def broadcast(msg: Msg) {
-		for (i < n) send(i, msg);
 	}
 }

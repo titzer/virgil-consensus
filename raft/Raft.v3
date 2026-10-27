@@ -1,0 +1,324 @@
+// The Raft consensus protocol: leader election and log replication
+// (no snapshots, no membership changes).
+//
+// Every node is a follower, candidate, or leader. Like all {Node}s, a RaftNode
+// never touches a network or clock directly; it has two timers, whose kinds
+// are {RaftTimer.ELECTION} and {RaftTimer.HEARTBEAT}, driven by the environment.
+//
+// Log indices are 1-based; index 0 is the empty prefix with term 0.
+// Commands are positive integers; command 0 is the no-op a new leader appends.
+
+// Timer kinds.
+component RaftTimer {
+	def ELECTION = 0;	// election timeout
+	def HEARTBEAT = 1;	// leader heartbeat
+}
+
+// A log entry: a command, tagged with the term in which a leader created it.
+type RaftEntry(term: int, cmd: int) #unboxed {
+	def render(buf: StringBuilder) -> StringBuilder {
+		return buf.put2("%d:%d", term, cmd);
+	}
+}
+
+// The message kinds exchanged between nodes.
+type RaftMsg {
+	// A candidate asks for a vote in {term}, describing the end of its log.
+	case RequestVote(term: int, lastLogIndex: int, lastLogTerm: int);
+	// Reply to RequestVote.
+	case Vote(term: int, granted: bool);
+	// The leader replicates {entries} after {prevIndex}/{prevTerm}; also a heartbeat.
+	case AppendEntries(term: int, prevIndex: int, prevTerm: int, entries: Array<RaftEntry>, leaderCommit: int);
+	// Reply to AppendEntries: on success, the follower's log matches the leader's
+	// up to {matchIndex}; on failure, {matchIndex} is the follower's last log index (a hint).
+	case AppendResp(term: int, success: bool, matchIndex: int);
+	// A follower forwards a client command to the leader.
+	case ClientRequest(cmd: int);
+
+	def render(buf: StringBuilder) -> StringBuilder {
+		match (this) {
+			RequestVote(t, li, lt) => buf.put3("RequestVote(t=%d, last=%d/t%d)", t, li, lt);
+			Vote(t, g) => buf.put2("Vote(t=%d, %s)", t, if(g, "granted", "denied"));
+			AppendEntries(t, pi, pt, entries, c) => {
+				buf.put3("AppendEntries(t=%d, prev=%d/t%d, [", t, pi, pt);
+				for (i < entries.length) {
+					if (i > 0) buf.csp();
+					entries[i].render(buf);
+				}
+				buf.put1("], commit=%d)", c);
+			}
+			AppendResp(t, s, m) => buf.put3("AppendResp(t=%d, %s, match=%d)", t, if(s, "ok", "fail"), m);
+			ClientRequest(c) => buf.put1("ClientRequest(%d)", c);
+		}
+		return buf;
+	}
+}
+
+enum RaftRole { FOLLOWER, CANDIDATE, LEADER }
+
+// Callbacks that let an environment observe protocol-level events (e.g. for checking).
+class RaftObserver {
+	def onElection(node: int, term: int) { }
+	def onLeader(node: int, term: int, log: Vector<RaftEntry>) { }
+	// Node {node} applies the committed entry at {index} to its state machine.
+	def onApply(node: int, index: int, entry: RaftEntry) { }
+}
+
+// Configuration knobs; the defaults are the correct protocol.
+// Turning them off injects bugs, which is useful for testing the fuzzer.
+class RaftConfig {
+	var persistVote = true;		// votedFor survives crashes
+	var upToDateCheck = true;	// only vote for candidates whose log is at least as up-to-date
+	var commitCurrentTerm = true;	// leader only commits entries of its own term by counting
+	var truncateOnMatch = false;	// BUG: follower always truncates its log after prevIndex
+	var noopOnElect = true;		// a new leader appends a no-op entry (not a bug if off)
+}
+
+// State that survives a crash (i.e. lives on simulated stable storage).
+class RaftStable {
+	var currentTerm: int;
+	var votedFor = -1;
+	def log = Vector<RaftEntry>.new();
+}
+
+class RaftNode extends Node<RaftMsg> {
+	def config: RaftConfig;
+	def observer: RaftObserver;
+	def stable = RaftStable.new();
+
+	// Volatile state.
+	var role: RaftRole;
+	var leaderId = -1;		// leader of the current term, if known
+	var commitIndex: int;
+	var lastApplied: int;
+	private var votes: Array<bool>;
+	private var numVotes: int;
+	private var nextIndex: Array<int>;
+	private var matchIndex: Array<int>;
+
+	new(id: int, n: int, config, observer) super(id, n) {
+		reset();
+	}
+
+	def majority() -> int {
+		return n / 2 + 1;
+	}
+	def term() -> int {
+		return stable.currentTerm;
+	}
+	def lastIndex() -> int {
+		return stable.log.length;
+	}
+	def termAt(index: int) -> int {
+		return if(index <= 0 || index > stable.log.length, 0, stable.log[index - 1].term);
+	}
+	def entryAt(index: int) -> RaftEntry {
+		return stable.log[index - 1];
+	}
+	// Discards all volatile state, as if the node had crashed and restarted.
+	def onRestart() {
+		if (!config.persistVote) stable.votedFor = -1;
+		reset();
+		stopTimer(RaftTimer.HEARTBEAT);
+	}
+	private def reset() {
+		role = RaftRole.FOLLOWER;
+		leaderId = -1;
+		commitIndex = 0;
+		lastApplied = 0;
+		votes = Array<bool>.new(n);
+		numVotes = 0;
+		nextIndex = Array<int>.new(n);
+		matchIndex = Array<int>.new(n);
+	}
+	// A client submits a command to this node. Returns false if it was dropped.
+	def submit(cmd: int) -> bool {
+		if (role == RaftRole.LEADER) {
+			append(cmd);
+			return true;
+		}
+		if (leaderId >= 0 && leaderId != id) {
+			send(leaderId, RaftMsg.ClientRequest(cmd));
+			return true;
+		}
+		return false;
+	}
+	def onTimer(kind: int) {
+		if (kind == RaftTimer.ELECTION) {
+			if (role != RaftRole.LEADER) startElection();
+		} else if (kind == RaftTimer.HEARTBEAT) {
+			if (role == RaftRole.LEADER) sendAppends();
+			else stopTimer(RaftTimer.HEARTBEAT);
+		}
+	}
+	def receive(src: int, msg: RaftMsg) {
+		match (msg) {
+			RequestVote(t, lli, llt) => {
+				if (t > term()) stepDown(t);
+				var granted = false, s = stable;
+				if (t == s.currentTerm && (s.votedFor < 0 || s.votedFor == src) && upToDate(lli, llt)) {
+					s.votedFor = src;
+					granted = true;
+					restartTimer(RaftTimer.ELECTION);
+				}
+				send(src, RaftMsg.Vote(s.currentTerm, granted));
+			}
+			Vote(t, granted) => {
+				if (t > term()) stepDown(t);
+				if (role != RaftRole.CANDIDATE || t != term() || !granted || votes[src]) return;
+				votes[src] = true;
+				if (++numVotes >= majority()) becomeLeader();
+			}
+			AppendEntries(t, prev, prevTerm, entries, leaderCommit) => {
+				if (t > term()) stepDown(t);
+				if (t < term()) {
+					send(src, RaftMsg.AppendResp(term(), false, lastIndex()));
+					return;
+				}
+				// {t} is the current term, so {src} is its one leader.
+				if (role != RaftRole.FOLLOWER) becomeFollower();
+				leaderId = src;
+				restartTimer(RaftTimer.ELECTION);
+				if (prev > lastIndex() || termAt(prev) != prevTerm) {
+					send(src, RaftMsg.AppendResp(term(), false, lastIndex()));
+					return;
+				}
+				var log = stable.log;
+				if (config.truncateOnMatch) log.resize(prev);
+				for (k < entries.length) {
+					var index = prev + 1 + k, e = entries[k];
+					if (index <= log.length) {
+						if (log[index - 1].term == e.term) continue;
+						log.resize(index - 1);	// conflict: delete this entry and all that follow
+					}
+					log.put(e);
+				}
+				var matched = prev + entries.length;
+				if (leaderCommit > commitIndex) {
+					var c = if(leaderCommit < matched, leaderCommit, matched);
+					if (c > commitIndex) commitIndex = c;
+				}
+				apply();
+				send(src, RaftMsg.AppendResp(term(), true, matched));
+			}
+			AppendResp(t, success, mi) => {
+				if (t > term()) stepDown(t);
+				if (role != RaftRole.LEADER || t != term()) return;
+				if (success) {
+					if (mi > matchIndex[src]) matchIndex[src] = mi;
+					if (mi + 1 > nextIndex[src]) nextIndex[src] = mi + 1;
+					advanceCommit();
+				} else {
+					// Back off, using the follower's log length as a hint.
+					var next = nextIndex[src] - 1;
+					if (mi + 1 < next) next = mi + 1;
+					if (next < 1) next = 1;
+					nextIndex[src] = next;
+					sendAppend(src, null);
+				}
+			}
+			ClientRequest(cmd) => {
+				if (role == RaftRole.LEADER) append(cmd);	// otherwise drop; never re-forward
+			}
+		}
+	}
+	private def upToDate(lli: int, llt: int) -> bool {
+		if (!config.upToDateCheck) return true;
+		var myTerm = termAt(lastIndex());
+		return llt > myTerm || (llt == myTerm && lli >= lastIndex());
+	}
+	private def stepDown(t: int) {
+		stable.currentTerm = t;
+		stable.votedFor = -1;
+		leaderId = -1;
+		if (role != RaftRole.FOLLOWER) becomeFollower();
+	}
+	private def becomeFollower() {
+		if (role == RaftRole.LEADER) {
+			stopTimer(RaftTimer.HEARTBEAT);
+			restartTimer(RaftTimer.ELECTION);
+		}
+		role = RaftRole.FOLLOWER;
+	}
+	private def startElection() {
+		var s = stable;
+		s.currentTerm++;
+		s.votedFor = id;
+		role = RaftRole.CANDIDATE;
+		leaderId = -1;
+		for (i < n) votes[i] = false;
+		votes[id] = true;
+		numVotes = 1;
+		restartTimer(RaftTimer.ELECTION);
+		observer.onElection(id, s.currentTerm);
+		if (numVotes >= majority()) {
+			becomeLeader();
+			return;
+		}
+		var msg = RaftMsg.RequestVote(s.currentTerm, lastIndex(), termAt(lastIndex()));
+		for (i < n) if (i != id) send(i, msg);
+	}
+	private def becomeLeader() {
+		role = RaftRole.LEADER;
+		leaderId = id;
+		for (i < n) {
+			nextIndex[i] = lastIndex() + 1;
+			matchIndex[i] = 0;
+		}
+		matchIndex[id] = lastIndex();
+		stopTimer(RaftTimer.ELECTION);
+		restartTimer(RaftTimer.HEARTBEAT);
+		observer.onLeader(id, term(), stable.log);
+		if (config.noopOnElect) append(0);
+		else sendAppends();
+	}
+	private def append(cmd: int) {
+		stable.log.put(RaftEntry(term(), cmd));
+		matchIndex[id] = lastIndex();
+		advanceCommit();
+		sendAppends();
+	}
+	// Sends AppendEntries to every follower. Followers with the same nextIndex
+	// share one entries array, so the messages compare equal (and print as one line).
+	private def sendAppends() {
+		var cache: (int, Array<RaftEntry>) = (-1, null);
+		for (i < n) {
+			if (i == id) continue;
+			var next = nextIndex[i];
+			if (cache.0 != next) cache = (next, entriesFrom(next));
+			sendAppend(i, cache.1);
+		}
+	}
+	private def sendAppend(dst: int, entries: Array<RaftEntry>) {
+		var next = nextIndex[dst];
+		if (entries == null) entries = entriesFrom(next);
+		var prev = next - 1;
+		send(dst, RaftMsg.AppendEntries(term(), prev, termAt(prev), entries, commitIndex));
+	}
+	private def entriesFrom(next: int) -> Array<RaftEntry> {
+		var log = stable.log;
+		if (next > log.length) return NO_ENTRIES;
+		return Arrays.range(log.array, next - 1, log.length);
+	}
+	// Commits the highest index replicated on a majority (of the current term, per Figure 8).
+	private def advanceCommit() {
+		for (index = lastIndex(); index > commitIndex; index--) {
+			if (config.commitCurrentTerm && termAt(index) != term()) break;
+			var count = 0;
+			for (i < n) if (matchIndex[i] >= index) count++;
+			if (count >= majority()) {
+				commitIndex = index;
+				break;
+			}
+		}
+		apply();
+	}
+	private def apply() {
+		while (lastApplied < commitIndex && lastApplied < lastIndex()) {
+			lastApplied++;
+			observer.onApply(id, lastApplied, entryAt(lastApplied));
+		}
+	}
+}
+
+def NO_ENTRIES = Array<RaftEntry>.new(0);

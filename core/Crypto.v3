@@ -1,0 +1,67 @@
+// Simulated digital signatures. Not cryptographically secure, but unforgeable
+// within the simulation: a signature's {tag} is a keyed hash of the digest
+// under the signer's secret key, and only a node's own {Signer} holds that key.
+// A Byzantine node can construct any {Sig} value it likes, but without the
+// secret it cannot produce a tag that {KeyRing.verify} accepts (except by
+// guessing a 64-bit value).
+type Sig(signer: int, digest: u64, tag: u64) #unboxed {
+	def render(buf: StringBuilder) -> StringBuilder {
+		return buf.put1("sig%d", signer);
+	}
+}
+
+// Holds every node's secret key; verification is public.
+class KeyRing {
+	private var secrets: Array<u64>;
+
+	new(n: int, rng: Rng) {
+		secrets = Array.new(n);
+		for (i < n) secrets[i] = rng.next() | 1;
+	}
+	// Returns the signing capability for node {id}. Give it only to node {id}
+	// (or, for Byzantine nodes, to the adversary controlling them).
+	def signer(id: int) -> Signer {
+		return Signer.new(id, secrets[id]);
+	}
+	def verify(s: Sig) -> bool {
+		if (s.signer < 0 || s.signer >= secrets.length) return false;
+		return s.tag == Crypto.mac(secrets[s.signer], s.digest);
+	}
+	// Verifies that {s} is a valid signature by {signer} over {digest}.
+	def verifyBy(s: Sig, signer: int, digest: u64) -> bool {
+		return s.signer == signer && s.digest == digest && verify(s);
+	}
+}
+
+class Signer(id: int, secret: u64) {
+	def sign(digest: u64) -> Sig {
+		return Sig(id, digest, Crypto.mac(secret, digest));
+	}
+}
+
+// Builds a digest (hash) from a sequence of integers, e.g. Digest.new().add(view).add(seq).get().
+class Digest {
+	var h = 0xcbf29ce484222325uL;
+
+	def add(x: int) -> this {
+		h = Crypto.mix(h ^ u64.view(x));
+	}
+	def addL(x: u64) -> this {
+		h = Crypto.mix(h ^ x);
+	}
+	def get() -> u64 {
+		return h;
+	}
+}
+
+component Crypto {
+	def mac(secret: u64, digest: u64) -> u64 {
+		return mix(mix(secret ^ digest) + secret);
+	}
+	// splitmix64 finalizer.
+	def mix(x: u64) -> u64 {
+		x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9uL;
+		x = (x ^ (x >> 27)) * 0x94d049bb133111ebuL;
+		return x ^ (x >> 31);
+	}
+}

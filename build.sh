@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Builds the Paxos scenarios and fuzzer as native binaries in bin/.
-# Usage: ./build.sh            build native binaries
-#        ./build.sh test       build, then run scenarios and a short fuzz
+# Builds each protocol's test program as a native binary in bin/.
+# Usage: ./build.sh [protocol...]        build (default: all protocols)
+#        ./build.sh test [protocol...]   build, then run scenarios and a short fuzz
 # Set VIRGIL to the Virgil checkout (default: ~/Code/virgil).
 set -e
 cd "$(dirname "${BASH_SOURCE[0]}")"
 VIRGIL=${VIRGIL:-$HOME/Code/virgil}
 export PATH=$VIRGIL/bin:$PATH
+ALL="paxos raft dolevstrong pbft"
 
 case "$(uname -s)-$(uname -m)" in
 	Darwin-*)        V3C=v3c-x86-64-darwin ;;
@@ -15,14 +16,24 @@ case "$(uname -s)-$(uname -m)" in
 	*)               echo "unsupported host; use run.sh to run in the interpreter"; exit 1 ;;
 esac
 
-LIB="$VIRGIL/lib/util/*.v3"
-PROTOCOL="Paxos.v3 Sim.v3 Diagram.v3"
-mkdir -p bin
-$V3C -output=bin $PROTOCOL Scenarios.v3 $LIB
-$V3C -output=bin $PROTOCOL Fuzz.v3 $LIB
-echo "built bin/Scenarios bin/Fuzz"
+TEST=0
+if [ "$1" = "test" ]; then TEST=1; shift; fi
+PROTOCOLS=${@:-$ALL}
 
-if [ "$1" = "test" ]; then
-	bin/Scenarios
-	bin/Fuzz -runs=10000
+mkdir -p bin
+for p in $PROTOCOLS; do
+	[ -d "$p" ] && ls $p/*.v3 > /dev/null 2>&1 || continue
+	# The Virgil scripts print a harmless git warning outside the Virgil repo.
+	$V3C -output=bin -program-name=$p core/*.v3 $p/*.v3 $VIRGIL/lib/util/*.v3 2>&1 | grep -v "outside repository" || true
+	[ -x bin/$p ] || { echo "build of $p failed"; exit 1; }
+	echo "built bin/$p"
+done
+
+if [ $TEST = 1 ]; then
+	for p in $PROTOCOLS; do
+		[ -x bin/$p ] || continue
+		echo "=== $p"
+		bin/$p scenarios
+		bin/$p fuzz -runs=10000
+	done
 fi

@@ -1,0 +1,34 @@
+// Base class for a protocol node that exchanges messages of type {M}.
+// Nodes never touch a network or a clock. Handling a message or a timer appends
+// outgoing messages to {outbox} and timer requests to {timerOps}; the environment
+// (e.g. a simulator) drains both and decides when things actually happen.
+class Node<M> {
+	def id: int;
+	def n: int;
+	def outbox = Vector<(int, M)>.new();		// (dst, msg)
+	def timerOps = Vector<(int, bool)>.new();	// (kind, true=restart / false=stop)
+
+	new(id, n) { }
+
+	// Handles a message from node {src}. Channels are authenticated: {src} is genuine.
+	def receive(src: int, msg: M);
+	// Called when this node's timer of the given {kind} fires.
+	def onTimer(kind: int) { }
+	// Called after a crash; the node must discard all volatile state.
+	def onRestart() { }
+
+	def send(dst: int, msg: M) {
+		outbox.put((dst, msg));
+	}
+	def broadcast(msg: M) {
+		for (i < n) outbox.put((i, msg));
+	}
+	// Requests that the timer of {kind} be restarted with a fresh (random) duration.
+	def restartTimer(kind: int) {
+		timerOps.put((kind, true));
+	}
+	// Requests that the timer of {kind} be stopped until restarted.
+	def stopTimer(kind: int) {
+		timerOps.put((kind, false));
+	}
+}

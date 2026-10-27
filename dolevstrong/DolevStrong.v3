@@ -1,0 +1,145 @@
+// Dolev-Strong authenticated Byzantine broadcast.
+//
+// A designated sender broadcasts a value to n nodes, up to f of which (possibly
+// including the sender) are Byzantine. With signatures, it tolerates any f < n,
+// in f+1 synchronous rounds. Honest nodes agree on a value, and if the sender
+// is honest, they all output its value.
+//
+// The protocol runs in lockstep rounds. A node's timer fires at the start of
+// every round. Messages sent in the timer of round r arrive in round r, and
+// messages sent while handling a delivery in round r arrive in round r+1.
+//
+// - Round 1: the sender signs its value and sends the chain [sender] to all.
+// - A chain is valid in round r if it has at least r signatures, the first is
+//   the sender's, the signers are distinct, and every signature verifies.
+//   Signature k signs a digest of (value, signers 0..k-1).
+// - When a node receives a valid chain for a value it hasn't extracted yet
+//   (it keeps at most two), it extracts the value and relays the chain with its
+//   own signature appended to all nodes.
+// - At the start of round f+2, after f+1 rounds of deliveries, a node outputs
+//   its extracted value if it extracted exactly one, and bottom (0) otherwise.
+//
+// Values are positive integers; 0 means bottom (no value).
+
+// The message kinds. Dolev-Strong needs only one: a value with its signature chain.
+type DsMsg {
+	case Chain(value: int, sigs: Array<Sig>);
+
+	// Renders the message; with {keys}, marks unverifiable signatures with '?'.
+	def render(buf: StringBuilder, keys: KeyRing) -> StringBuilder {
+		match (this) {
+			Chain(v, sigs) => {
+				buf.put1("Chain(v=%d, ", v);
+				for (i < sigs.length) {
+					var s = sigs[i];
+					if (i > 0) buf.putc('>');
+					buf.putd(s.signer);
+					if (keys != null && !keys.verifyBy(s, s.signer, DsChain.digest(v, sigs, i))) buf.putc('?');
+				}
+				buf.putc(')');
+			}
+		}
+		return buf;
+	}
+}
+
+component DsChain {
+	// The digest signed by the {k}th signer of a chain: (value, signers 0..k-1).
+	def digest(value: int, sigs: Array<Sig>, k: int) -> u64 {
+		var d = Digest.new().add(value);
+		for (i < k) d.add(sigs[i].signer);
+		return d.get();
+	}
+	// Appends a signature by {signer} to the chain.
+	def extend(value: int, sigs: Array<Sig>, signer: Signer) -> Array<Sig> {
+		var s = signer.sign(digest(value, sigs, sigs.length));
+		return Arrays.append(s, sigs);
+	}
+	// Checks that the chain's signers are pairwise distinct.
+	def distinct(sigs: Array<Sig>) -> bool {
+		for (i < sigs.length) {
+			for (j < i) if (sigs[i].signer == sigs[j].signer) return false;
+		}
+		return true;
+	}
+	// Checks that every signature in the chain verifies.
+	def verified(value: int, sigs: Array<Sig>, keys: KeyRing) -> bool {
+		for (i < sigs.length) {
+			var s = sigs[i];
+			if (!keys.verifyBy(s, s.signer, digest(value, sigs, i))) return false;
+		}
+		return true;
+	}
+}
+
+// Callbacks that let an environment observe protocol-level events (e.g. for checking).
+class DsObserver {
+	def onExtract(node: int, value: int, sigs: Array<Sig>) { }
+	def onDecide(node: int, value: int) { }
+}
+
+// Configuration knobs; the defaults are the correct protocol.
+// Turning them off injects bugs, which is useful for testing the fuzzer.
+class DsConfig {
+	var extraRound = true;		// run f+1 rounds (false: only f)
+	var checkSigs = true;		// verify signatures
+	var checkDistinct = true;	// require distinct signers
+	var relay = true;		// relay newly extracted values
+}
+
+class DsNode extends Node<DsMsg> {
+	def sender: int;		// the designated sender
+	def f: int;			// number of faults tolerated
+	def keys: KeyRing;		// for verification only
+	def signer: Signer;		// this node's own signing key
+	def config: DsConfig;
+	def observer: DsObserver;
+	var input: int;			// the sender's value to broadcast
+	var round: int;			// current round, counted by timer firings
+	var decided = -1;		// output value (0 = bottom), -1 if not yet decided
+	def extracted = Vector<int>.new();
+
+	new(id: int, n: int, sender, f, keys, signer, config, observer) super(id, n) { }
+
+	// The round at whose start a node outputs its decision.
+	def decideRound() -> int {
+		return if(config.extraRound, f + 2, f + 1);
+	}
+	def onTimer(kind: int) {
+		if (decided >= 0) return;
+		round++;
+		if (round == decideRound()) {
+			decided = if(extracted.length == 1, extracted[0], 0);
+			observer.onDecide(id, decided);
+			return;
+		}
+		if (round == 1 && id == sender) {
+			extract(input, []);
+			broadcast(DsMsg.Chain(input, DsChain.extend(input, [], signer)));
+		}
+	}
+	def receive(src: int, msg: DsMsg) {
+		if (decided >= 0) return;
+		match (msg) {
+			Chain(v, sigs) => {
+				if (!valid(v, sigs)) return;
+				for (i < extracted.length) if (extracted[i] == v) return;
+				if (extracted.length >= 2) return; // two values suffice to output bottom
+				extract(v, sigs);
+				if (config.relay) broadcast(DsMsg.Chain(v, DsChain.extend(v, sigs, signer)));
+			}
+		}
+	}
+	private def valid(v: int, sigs: Array<Sig>) -> bool {
+		if (v <= 0) return false;
+		if (sigs.length < round || sigs.length == 0) return false;
+		if (sigs[0].signer != sender) return false;
+		if (config.checkDistinct && !DsChain.distinct(sigs)) return false;
+		if (config.checkSigs && !DsChain.verified(v, sigs, keys)) return false;
+		return true;
+	}
+	private def extract(v: int, sigs: Array<Sig>) {
+		extracted.put(v);
+		observer.onExtract(id, v, sigs);
+	}
+}
