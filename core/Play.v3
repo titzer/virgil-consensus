@@ -1,0 +1,197 @@
+// Interactive play: before each simulation event, show the event the simulator
+// is about to perform (the default) and a small menu of other actions that are
+// valid right now, and wait for a key.
+//
+//   SPACE        perform the default event
+//   ENTER        stop asking; run the rest of the simulation to completion
+//   q            like ENTER, but stop printing too (only the verdict is shown)
+//   1-9, A-Z     pick an in-flight message, then: SPACE/d deliver, x drop, 2 duplicate
+//   c / r / t    crash a node / restart a node / fire one of a node's timers
+//
+// Pressing only SPACE reproduces exactly the run the simulator would have done
+// on its own, since the default event is planned with the same random numbers.
+// Keys are read one byte at a time from stdin; play.sh puts the terminal in raw
+// mode so that keys arrive without waiting for a newline. End of input acts as ENTER.
+class Player<M> extends SimController<M> {
+	def ansi: bool;		// erase each menu after use with ANSI escape codes
+	def MAX_SHOWN = 15;	// max number of in-flight messages listed
+	def WIDTH = 100;	// max width of a menu line
+	var active = true;
+	var lines: int;		// lines printed by the current menu, to erase
+
+	new(ansi) { }
+
+	def before(sim: Sim<M>, e: SimEvent<M>) {
+		if (!active || sim.isEndRound(e)) return;
+		match (e) {
+			Fire(i, k) => if (sim.isQuiet(k)) return;	// e.g. lockstep round ticks
+			_ => ;
+		}
+		while (active) {
+			sim.listener.onQuiet(sim);
+			var pending = sim.pending();
+			mainMenu(sim, e, pending);
+			var key = readKey();
+			erase();
+			match (key) {
+				' ' => return;
+				'\n', '\r', -1 => active = false;
+				'q' => {
+					active = false;
+					sim.listener = SimListener<M>.new();
+					System.puts("(running to completion quietly)\n");
+				}
+				'c' => if (canCrash(sim)) pickNode(sim, "crash", true, crashNode);
+				'r' => if (canCrash(sim)) pickNode(sim, "restart", false, restartNode);
+				't' => if (!sim.faults.lockstep) pickTimer(sim);
+				_ => {
+					var k = messageIndex(key);
+					if (k >= 0 && k < pending.length && k < MAX_SHOWN) pickMessage(sim, k, pending[k]);
+				}
+			}
+		}
+	}
+
+	private def mainMenu(sim: Sim<M>, e: SimEvent<M>, pending: Vector<Packet<M>>) {
+		line(bold(StringBuilder.new().put1("round %d, next: ", sim.round)).puts(describe(sim, e).toString()));
+		var buf = StringBuilder.new().puts("  SPACE do it   ENTER run to completion   q finish quietly");
+		if (canCrash(sim)) buf.puts("   c crash   r restart");
+		if (!sim.faults.lockstep) buf.puts("   t fire a timer");
+		line(buf);
+		if (pending.length == 0) {
+			line(StringBuilder.new().puts("  (no other messages in flight)"));
+			return;
+		}
+		line(StringBuilder.new().puts("  or pick a message in flight:"));
+		for (k < pending.length) {
+			if (k == MAX_SHOWN) {
+				line(StringBuilder.new().put1("     ... and %d more", pending.length - k));
+				break;
+			}
+			line(renderPacket(sim, StringBuilder.new().puts("   ").putc(messageKey(k)).puts("  "), pending[k]));
+		}
+	}
+	private def pickMessage(sim: Sim<M>, k: int, p: Packet<M>) {
+		var buf = renderPacket(sim, StringBuilder.new().puts("message: "), p);
+		line(bold(buf));
+		buf = StringBuilder.new().puts("  SPACE/d deliver");
+		var reliable = sim.faults.lockstep;
+		if (!reliable) buf.puts("   x drop   2 deliver and keep a duplicate in flight");
+		line(buf.puts("   ESC cancel"));
+		var key = readKey();
+		erase();
+		match (key) {
+			' ', 'd' => sim.deliverNow(sim.takePending(k));
+			'x' => if (!reliable) sim.perform(SimEvent.Drop(sim.takePending(k)));
+			'2' => {
+				if (!reliable) {
+					var q = sim.takePending(k);
+					sim.perform(SimEvent.Deliver(q, true));
+					sim.listener.onQuiet(sim);
+				}
+			}
+			_ => ;
+		}
+	}
+	private def pickNode(sim: Sim<M>, verb: string, wantUp: bool, action: (Sim<M>, int) -> void) {
+		var buf = StringBuilder.new().put1("%s which node?", verb);
+		var any = false;
+		for (i < sim.n) {
+			if (sim.up[i] == wantUp) {
+				buf.put1("  %d", i);
+				any = true;
+			}
+		}
+		if (!any) return;
+		line(bold(buf).puts("   (ESC cancel)"));
+		var key = readKey();
+		erase();
+		var i = key - '0';
+		if (i >= 0 && i < sim.n && i < 10 && sim.up[i] == wantUp) action(sim, i);
+	}
+	private def pickTimer(sim: Sim<M>) {
+		var buf = StringBuilder.new().puts("fire a timer at which node?");
+		for (i < sim.n) if (sim.up[i]) buf.put1("  %d", i);
+		line(bold(buf).puts("   (ESC cancel)"));
+		var key = readKey();
+		erase();
+		var i = key - '0';
+		if (i < 0 || i >= sim.n || i >= 10 || !sim.up[i]) return;
+		var kinds = Vector<int>.new();
+		for (k < sim.numTimers()) if (!sim.isQuiet(k)) kinds.put(k);
+		if (kinds.length == 0) return;
+		var kind = kinds[0];
+		if (kinds.length > 1) {
+			line(bold(StringBuilder.new().put1("which timer at N%d?", i)).puts("   (ESC cancel)"));
+			for (j < kinds.length) line(StringBuilder.new().put2("   %d  %s", j, sim.describeTimer(i, kinds[j])));
+			key = readKey();
+			erase();
+			var j = key - '0';
+			if (j < 0 || j >= kinds.length) return;
+			kind = kinds[j];
+		}
+		sim.perform(SimEvent.Fire(i, kind));
+		sim.listener.onQuiet(sim);
+	}
+	private def canCrash(sim: Sim<M>) -> bool {
+		return sim.crashable && !sim.faults.lockstep;
+	}
+	private def describe(sim: Sim<M>, e: SimEvent<M>) -> StringBuilder {
+		var buf = StringBuilder.new();
+		match (e) {
+			Crash(i) => buf.put1("N%d crashes", i);
+			Restart(i) => buf.put1("N%d restarts", i);
+			Fire(i, k) => buf.put2("N%d %s", i, sim.describeTimer(i, k));
+			Deliver(p, dup) => {
+				renderPacket(sim, buf.puts("deliver "), p);
+				if (dup) buf.puts("  (a duplicate stays in flight)");
+			}
+			Drop(p) => renderPacket(sim, buf.puts("lose "), p);
+			EndRound => buf.puts("end of round");
+		}
+		return buf;
+	}
+	private def renderPacket(sim: Sim<M>, buf: StringBuilder, p: Packet<M>) -> StringBuilder {
+		buf.putc(label(sim, p.src)).putd(p.src).puts(" -> ").putc(label(sim, p.dst)).putd(p.dst).puts(": ");
+		return sim.render(p.msg, buf);
+	}
+	// Prints one menu line, truncated so that it cannot wrap (and break erasing).
+	private def line(buf: StringBuilder) {
+		var s = buf.toString();
+		if (s.length > WIDTH) s = Arrays.range(s, 0, WIDTH);
+		System.puts(s);
+		System.ln();
+		lines++;
+	}
+	private def bold(buf: StringBuilder) -> StringBuilder {
+		if (!ansi) return buf;
+		var s = buf.toString();
+		return StringBuilder.new().puts("\x1B[1m").puts(s).puts("\x1B[0m");
+	}
+	// Erases the lines of the menu just shown, so the diagram stays clean.
+	private def erase() {
+		if (ansi && lines > 0) System.puts(StringBuilder.new().puts("\x1B[").putd(lines).puts("F\x1B[J").toString());
+		lines = 0;
+	}
+	private def readKey() -> int {
+		return System.fileRead(0);
+	}
+	private def label(sim: Sim<M>, i: int) -> byte {
+		return if(sim.byzantine[i], 'B', 'N');
+	}
+	private def messageKey(k: int) -> byte {
+		return byte.view(if(k < 9, '1' + k, 'A' + k - 9));
+	}
+	private def messageIndex(key: int) -> int {
+		if (key >= '1' && key <= '9') return key - '1';
+		if (key >= 'A' && key <= 'Z') return key - 'A' + 9;
+		return -1;
+	}
+}
+
+def crashNode<M>(sim: Sim<M>, i: int) {
+	sim.crash(i);
+}
+def restartNode<M>(sim: Sim<M>, i: int) {
+	sim.restart(i);
+}

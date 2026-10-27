@@ -52,6 +52,8 @@ class PbftSim extends Sim<PbftMsg> {
 	new(f, seed: u64, opts: TestOptions) super(3 * f + 1, seed, renderPbft) {
 		addTimer(20, 40);		// VIEWCHANGE
 		listener = opts.listener<PbftMsg>();
+		controller = opts.controller<PbftMsg>();
+		crashable = false;	// honest replicas don't persist state, so crashes are outside the model
 		if (opts.hasBug("quorum")) config.weakQuorum = true;
 		if (opts.hasBug("nosig")) config.skipCertSigs = true;
 		if (opts.hasBug("newview")) config.trustNewView = true;

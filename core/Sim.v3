@@ -45,6 +45,7 @@ class SimFaults {
 	var crashPct = 0;	// chance each up node crashes this round
 	var restartPct = 0;	// chance each down node restarts this round
 	var maxInFlight = 2000;	// excess messages are dropped (bounds duplication blowup)
+	var lockstep = false;	// synchronous model: messages may only be reordered within a round
 
 	def render(buf: StringBuilder) -> StringBuilder {
 		return buf.put3("deliver=%d%% drop=%d%% dup=%d%% ", deliverPct, dropPct, dupPct)
@@ -59,6 +60,7 @@ class SimFaults {
 	}
 	// A synchronous, reliable network: every message is delivered in the next round.
 	def synchronous() {
+		lockstep = true;
 		deliverPct = 100;
 		dropPct = 0;
 		dupPct = 0;
@@ -66,6 +68,27 @@ class SimFaults {
 		restartPct = 0;
 	}
 }
+
+// One event of a simulation round.
+type SimEvent<M> {
+	case Crash(node: int);
+	case Restart(node: int);
+	case Fire(node: int, kind: int);		// a timer of the given kind expires
+	case Deliver(p: Packet<M>, dup: bool);	// if {dup}, a copy also stays in flight
+	case Drop(p: Packet<M>);
+	case EndRound;
+}
+
+// Sees each event of {Sim.step} before it is performed, e.g. to let a user
+// intervene. It may call {Sim} methods (deliver, crash, ...) in the meantime.
+class SimController<M> {
+	def before(sim: Sim<M>, e: SimEvent<M>) { }
+}
+
+def PHASE_START = 0;
+def PHASE_FAULTS = 1;
+def PHASE_TIMERS = 2;
+def PHASE_DELIVER = 3;
 
 class Sim<M> {
 	def n: int;
@@ -81,6 +104,14 @@ class Sim<M> {
 	var autoTimers = true;			// fire node timers automatically in {step}
 	var announceRounds = false;		// report "--- round r ---" at the start of each step
 	var violation: string;			// first safety violation reported, null if none
+	var controller: SimController<M>;	// sees every event of {step} before it happens, if non-null
+	var crashable = true;			// whether crashing nodes is within the protocol's fault model
+
+	// Progress through the current round (see {planNext}).
+	private var phase = PHASE_START;
+	private var cursor: int;
+	private var cursorKind: int;
+	private var batch: Vector<Packet<M>>;	// messages chosen for delivery this round
 
 	private var timerMin = Vector<int>.new();
 	private var timerMax = Vector<int>.new();
@@ -160,39 +191,152 @@ class Sim<M> {
 		for (i < n) restart(i);
 	}
 	// Runs one simulation round: faults, timers, then message delivery.
+	// A round is a sequence of events, each chosen by {planNext} and executed by
+	// {perform}. A {controller} (e.g. an interactive player) sees each planned
+	// event before it happens, and may perform other actions first.
 	def step() -> this {
-		round++;
-		if (announceRounds) note(StringBuilder.new().put1("--- round %d ---", round).toString());
-		// Crash and restart nodes.
-		for (i < n) {
-			if (up[i]) {
-				if (faults.crashPct > 0 && rng.chance(faults.crashPct)) crash(i);
-			} else {
-				if (faults.restartPct > 0 && rng.chance(faults.restartPct)) restart(i);
-			}
+		while (true) {
+			var e = planNext();
+			if (controller != null) controller.before(this, e);
+			perform(e);
+			if (controller != null) listener.onQuiet(this);
+			if (isEndRound(e)) break;
 		}
-		// Fire expired timers.
-		if (autoTimers) {
-			for (i < n) {
-				for (k < timerMin.length) {
-					var t = nextFire[i][k];
-					if (up[i] && t >= 0 && round >= t) {
-						restartTimerOf(i, k);
-						fire(i, k);
-					}
+	}
+	// Chooses the next event of the current round (starting a new round if
+	// necessary), consuming random numbers exactly as a full {step} would.
+	// Every planned event must be passed to {perform} before planning again.
+	def planNext() -> SimEvent<M> {
+		if (phase == PHASE_START) {
+			round++;
+			if (announceRounds) note(StringBuilder.new().put1("--- round %d ---", round).toString());
+			phase = PHASE_FAULTS;
+			cursor = 0;
+		}
+		if (phase == PHASE_FAULTS) {
+			// Crash and restart nodes.
+			while (cursor < n) {
+				var i = cursor++;
+				if (up[i]) {
+					if (faults.crashPct > 0 && rng.chance(faults.crashPct)) return SimEvent.Crash(i);
+				} else {
+					if (faults.restartPct > 0 && rng.chance(faults.restartPct)) return SimEvent.Restart(i);
 				}
 			}
+			phase = PHASE_TIMERS;
+			cursor = 0;
+			cursorKind = 0;
 		}
-		// Choose a random subset of in-flight messages to deliver.
-		var batch = Vector<Packet<M>>.new(), keep = Vector<Packet<M>>.new();
-		for (i < inFlight.length) {
-			var p = inFlight[i];
-			if (faults.deliverPct >= 100 || rng.chance(faults.deliverPct)) batch.put(p);
-			else keep.put(p);
+		if (phase == PHASE_TIMERS) {
+			// Fire expired timers.
+			while (autoTimers && cursor < n) {
+				var i = cursor;
+				while (cursorKind < timerMin.length) {
+					var k = cursorKind++;
+					var t = nextFire[i][k];
+					if (up[i] && t >= 0 && round >= t) return SimEvent.Fire(i, k);
+				}
+				cursor++;
+				cursorKind = 0;
+			}
+			// Choose a random subset of in-flight messages to deliver, in a random order.
+			var keep = Vector<Packet<M>>.new();
+			batch = Vector<Packet<M>>.new();
+			for (i < inFlight.length) {
+				var p = inFlight[i];
+				if (faults.deliverPct >= 100 || rng.chance(faults.deliverPct)) batch.put(p);
+				else keep.put(p);
+			}
+			inFlight = keep;
+			var a = batch.array;
+			for (i = batch.length - 1; i > 0; i--) {	// Fisher-Yates shuffle
+				var j = rng.range(i + 1);
+				var t = a[i];
+				a[i] = a[j];
+				a[j] = t;
+			}
+			phase = PHASE_DELIVER;
+			cursor = 0;
 		}
-		inFlight = keep;
-		deliverBatch(batch);
+		// Deliver (or drop, or duplicate) the next message of the batch.
+		if (cursor < batch.length) {
+			var p = batch[cursor++];
+			if (faults.dropPct > 0 && rng.chance(faults.dropPct)) return SimEvent.Drop(p);
+			return SimEvent.Deliver(p, faults.dupPct > 0 && rng.chance(faults.dupPct));
+		}
+		phase = PHASE_START;
+		batch = null;
+		return SimEvent.EndRound;
+	}
+	// Executes an event, normally one returned by {planNext}.
+	def perform(e: SimEvent<M>) -> this {
+		match (e) {
+			Crash(i) => crash(i);
+			Restart(i) => restart(i);
+			Fire(i, k) => {
+				if (up[i]) {
+					restartTimerOf(i, k);
+					fire(i, k);
+				}
+			}
+			Deliver(p, dup) => {
+				if (dup) {
+					duplicated++;
+					inFlight.put(p);
+				}
+				deliver(p);
+			}
+			Drop(p) => {
+				dropped++;
+				listener.onDrop(this, p);
+			}
+			EndRound => {
+				// Bound the number of in-flight messages by dropping random ones.
+				while (inFlight.length > faults.maxInFlight) {
+					var j = rng.range(inFlight.length);
+					var p = inFlight[j];
+					inFlight[j] = inFlight[inFlight.length - 1];
+					inFlight.resize(inFlight.length - 1);
+					dropped++;
+					listener.onDrop(this, p);
+				}
+				listener.onQuiet(this);
+			}
+		}
+	}
+	def isEndRound(e: SimEvent<M>) -> bool {
+		match (e) {
+			EndRound => return true;
+			_ => return false;
+		}
+	}
+	// Returns all messages in flight: the rest of the current round's delivery
+	// batch (in delivery order), then all others.
+	def pending() -> Vector<Packet<M>> {
+		var v = Vector<Packet<M>>.new();
+		if (batch != null) for (i = cursor; i < batch.length; i++) v.put(batch[i]);
+		return v.putv(inFlight);
+	}
+	// Removes the {k}th message of {pending()} from flight and returns it.
+	def takePending(k: int) -> Packet<M> {
+		var rest = if(batch != null, batch.length - cursor, 0);
+		var v = if(k < rest, batch, inFlight);
+		var idx = if(k < rest, cursor + k, k - rest);
+		var p = v[idx];
+		for (i = idx + 1; i < v.length; i++) v[i - 1] = v[i];
+		v.resize(v.length - 1);
+		return p;
+	}
+	// Immediately delivers {p}, which must not be in flight (see {takePending}).
+	def deliverNow(p: Packet<M>) -> this {
+		deliver(p);
 		listener.onQuiet(this);
+	}
+	def isQuiet(kind: int) -> bool {
+		return timerQuiet[kind];
+	}
+	def numTimers() -> int {
+		return timerMin.length;
 	}
 	// Delivers every in-flight message for which {pred} returns true (no faults).
 	def deliverIf(pred: Packet<M> -> bool) -> this {
@@ -250,38 +394,6 @@ class Sim<M> {
 
 	private def restartTimerOf(i: int, kind: int) {
 		nextFire[i][kind] = round + rng.between(timerMin[kind], timerMax[kind]);
-	}
-	private def deliverBatch(batch: Vector<Packet<M>>) {
-		// Deliver in a random order (Fisher-Yates shuffle).
-		var a = batch.array;
-		for (i = batch.length - 1; i > 0; i--) {
-			var j = rng.range(i + 1);
-			var t = a[i];
-			a[i] = a[j];
-			a[j] = t;
-		}
-		for (i < batch.length) {
-			var p = a[i];
-			if (faults.dropPct > 0 && rng.chance(faults.dropPct)) {
-				dropped++;
-				listener.onDrop(this, p);
-				continue;
-			}
-			if (faults.dupPct > 0 && rng.chance(faults.dupPct)) {
-				duplicated++;
-				inFlight.put(p);
-			}
-			deliver(p);
-		}
-		// Bound the number of in-flight messages by dropping random ones.
-		while (inFlight.length > faults.maxInFlight) {
-			var j = rng.range(inFlight.length);
-			var p = inFlight[j];
-			inFlight[j] = inFlight[inFlight.length - 1];
-			inFlight.resize(inFlight.length - 1);
-			dropped++;
-			listener.onDrop(this, p);
-		}
 	}
 	private def deliver(p: Packet<M>) {
 		if (!up[p.dst]) {

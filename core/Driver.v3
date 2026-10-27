@@ -1,7 +1,9 @@
 // Shared command-line driver for each protocol's test program.
 //
-// Usage: <protocol> scenarios [-v | -trace] [name-filter]
-//        <protocol> fuzz [-seed=N] [-runs=N] [-chaos=N] [-bound=N] [-bug=NAME] [-v | -trace]
+// Usage: <protocol> scenarios [-v | -trace | -play] [name-filter]
+//        <protocol> fuzz [-seed=N] [-runs=N] [-chaos=N] [-bound=N] [-bug=NAME] [-v | -trace | -play]
+//
+// -play makes the simulation interactive (see core/Play.v3); use it via play.sh.
 //
 // Each protocol provides a {Suite} with its scenarios, injectable bugs, and a
 // fuzzer for a single run. Fuzz run i uses seed (N + i); a failing run is
@@ -17,12 +19,19 @@ class TestOptions {
 	var bound = 3000;	// liveness bound: rounds after stabilization
 	var bug: string;	// name of a deliberately injected protocol bug, or null
 	var filter: string;	// scenario name filter
+	var play = false;	// interactive: ask the user before each simulation event
+	var ansi = true;	// in play mode, erase menus with ANSI escape codes
+	var runsGiven = false;
 
 	// Creates a listener for a simulation, according to the options.
 	def listener<M>() -> SimListener<M> {
 		if (trace) return TextLog<M>.new();
 		if (verbose) return Diagram<M>.new();
 		return SimListener<M>.new();
+	}
+	// Creates a controller for a simulation: an interactive player, or null.
+	def controller<M>() -> SimController<M> {
+		return if(play, Player<M>.new(ansi));
 	}
 	def hasBug(name: string) -> bool {
 		return bug != null && Strings.equal(bug, name);
@@ -49,14 +58,17 @@ component Driver {
 			var a = args[i];
 			if (Strings.equal(a, "-v")) opts.verbose = true;
 			else if (Strings.equal(a, "-trace")) opts.trace = opts.verbose = true;
+			else if (Strings.equal(a, "-play")) opts.play = opts.verbose = true;
+			else if (Strings.equal(a, "-plain")) opts.ansi = false;
 			else if (Strings.startsWith(a, "-seed=")) opts.seed = intArg(a, 6);
-			else if (Strings.startsWith(a, "-runs=")) opts.runs = intArg(a, 6);
+			else if (Strings.startsWith(a, "-runs=")) { opts.runs = intArg(a, 6); opts.runsGiven = true; }
 			else if (Strings.startsWith(a, "-chaos=")) opts.chaos = intArg(a, 7);
 			else if (Strings.startsWith(a, "-bound=")) opts.bound = intArg(a, 7);
 			else if (Strings.startsWith(a, "-bug=")) opts.bug = Arrays.range(a, 5, a.length);
 			else if (a.length > 0 && a[0] == '-') return usage(suite, a);
 			else opts.filter = a;
 		}
+		if (opts.play && !opts.runsGiven) opts.runs = 1;	// play one fuzz run unless told otherwise
 		if (opts.bug != null) {
 			var found = false;
 			for (b in suite.bugs) if (Strings.equal(b.0, opts.bug)) found = true;
@@ -119,8 +131,11 @@ component Driver {
 	def usage(suite: Suite, arg: string) -> int {
 		var buf = StringBuilder.new();
 		if (arg != null) buf.put1("unknown argument: %s\n", arg);
-		buf.put1("Usage: %s scenarios [-v | -trace] [name-filter]\n", suite.name);
-		buf.put1("       %s fuzz [-seed=N] [-runs=N] [-chaos=N] [-bound=N] [-bug=NAME] [-v | -trace]\n", suite.name);
+		buf.put1("Usage: %s scenarios [-v | -trace | -play] [name-filter]\n", suite.name);
+		buf.put1("       %s fuzz [-seed=N] [-runs=N] [-chaos=N] [-bound=N] [-bug=NAME] [-v | -trace | -play]\n", suite.name);
+		buf.puts("  -v      print a message sequence diagram\n");
+		buf.puts("  -trace  print a raw event log\n");
+		buf.puts("  -play   interactive: choose each event (run via play.sh for single-key input)\n");
 		if (suite.bugs.length > 0) {
 			buf.puts("Injectable bugs:\n");
 			for (b in suite.bugs) buf.put2("  -bug=%s: %s\n", b.0, b.1);

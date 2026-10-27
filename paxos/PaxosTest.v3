@@ -22,6 +22,7 @@ class PaxosSim extends Sim<PaxosMsg> {
 		addTimer(8, 24);
 		checker = PaxosChecker.new(this);
 		listener = opts.listener<PaxosMsg>();
+		controller = opts.controller<PaxosMsg>();
 		if (opts.hasBug("acceptor")) config.persistAcceptor = false;
 		if (opts.hasBug("round")) config.persistRound = false;
 		if (opts.hasBug("adopt")) config.adoptAccepted = false;

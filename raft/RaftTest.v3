@@ -31,6 +31,7 @@ class RaftSim extends Sim<RaftMsg> {
 		addTimer(3, 3);				// RaftTimer.HEARTBEAT
 		checker = RaftChecker.new(this);
 		listener = opts.listener<RaftMsg>();
+		controller = opts.controller<RaftMsg>();
 		if (opts.hasBug("vote")) config.persistVote = false;
 		if (opts.hasBug("uptodate")) config.upToDateCheck = false;
 		if (opts.hasBug("commit")) config.commitCurrentTerm = false;

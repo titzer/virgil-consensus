@@ -343,6 +343,18 @@ The bugs:
   learn anything that might already be decided, from a quorum that overlaps
   every quorum that could have decided it.
 
+## Playing it yourself
+
+The best way to build intuition is to play the scheduler yourself. For
+example, `./play.sh paxos fuzz -seed=77` stops before every event and shows
+what the simulator is about to do. Press SPACE to let it, or pick any
+in-flight message to deliver or drop instead. You can also crash a node or
+fire its timer. Try building the Raft Figure 8 counterexample by hand, or
+starving a PBFT primary until the replicas give up on it. The checker is
+still watching, so the moment you find an interleaving that breaks a rule
+(with a `-bug=` switched on, if you want it to be possible), the diagram
+says so.
+
 ## Things to try
 
 ```sh
@@ -352,6 +364,7 @@ bin/raft fuzz -bug=uptodate                     # find a stale-leader counterexa
 bin/dolevstrong scenarios -v "f = n-1"          # 3 of 4 nodes are traitors, and it still works
 bin/pbft scenarios -v "two faulty primaries"    # two view changes in a row (f=2)
 bin/pbft fuzz -runs=100000                      # leave it running; it should print 0 failures
+./play.sh raft fuzz -seed=13 -bug=uptodate      # step through a counterexample, or change its course
 ```
 
 To change a protocol, edit `<protocol>/<Name>.v3`, rebuild, and run

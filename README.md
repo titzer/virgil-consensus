@@ -31,6 +31,41 @@ bin/paxos                               # usage, including the list of injectabl
 ./run.sh paxos scenarios -v happy       # same programs, in the interpreter
 ```
 
+### Interactive play
+
+```sh
+./play.sh raft fuzz -seed=13 -bug=uptodate     # step through a fuzz run, one event at a time
+./play.sh paxos scenarios dueling              # play a randomized scenario
+```
+
+Before each event, the simulation stops and shows the event it is about to
+perform (the default), the messages in flight, and the other actions that
+make sense right now:
+
+| Key | Action |
+|-----|--------|
+| `SPACE` | perform the default event |
+| `ENTER` | stop asking and run the rest to completion (the diagram keeps printing) |
+| `q` | run the rest to completion quietly, printing only the verdict |
+| `1`-`9`, `A`-`Z` | pick an in-flight message, then `SPACE`/`d` deliver it, `x` drop it, `2` deliver it and keep a duplicate in flight |
+| `c` / `r` | crash an up node / restart a down node |
+| `t` | fire one of a node's timers (e.g. force an election or a view change) |
+
+Only actions within the protocol's fault model are offered. Dolev-Strong is
+synchronous, so its messages can only be reordered within a round. PBFT's
+honest replicas can't be crashed. The default event is planned with the same
+random numbers the simulator would use, so pressing only SPACE replays the
+seed's run exactly. Any other key turns it into a run of your own, still
+watched by the protocol's checker.
+
+`play.sh` puts the terminal into raw mode, so a key registers without ENTER,
+and restores it on exit. Each menu is erased after use, so only the diagram
+stays on screen. Without the wrapper, `bin/<protocol> ... -play` reads keys
+from stdin, so you can script a session: `printf '   2x' | bin/paxos fuzz
+-seed=77 -play -plain`. Add `-plain` to turn off the ANSI escape codes.
+Scripted scenarios run their scripted steps without stopping; only events
+from the random simulator (`Sim.step`) wait for a key.
+
 The build script uses the Virgil checkout in `~/Code/virgil`, or `$VIRGIL` if
 it is set. The scenario filter is the last non-flag argument, and it matches
 part of the scenario name, case-sensitively. Quote filters that contain
@@ -45,6 +80,7 @@ spaces. `-trace` prints a plain event log instead of a diagram.
 | `core/Crypto.v3` | Simulated signatures: `Sig`, `KeyRing`, `Signer`, `Digest`. |
 | `core/Diagram.v3` | `Diagram<M>`: prints any simulation as a lifeline diagram. |
 | `core/Driver.v3` | Command-line driver: `TestOptions`, `Scenario`, `Suite`, scenario runner, fuzz loop. |
+| `core/Play.v3` | `Player<M>`: the interactive controller for `-play`. |
 | `<protocol>/<Name>.v3` | The protocol itself: its message ADT and node class. |
 | `<protocol>/<Name>Test.v3` | Simulation harness, safety and liveness checker, scenarios, fuzzer, `main`. |
 
@@ -54,7 +90,9 @@ directory, plus Virgil's `lib/util`.
 ## The simulator
 
 A `Sim<M>` owns the nodes, the messages in flight, and all randomness. Each
-`step()`:
+`step()` is a sequence of events: `planNext()` picks each one and `perform()`
+executes it, and a `SimController` such as the interactive player may step in
+between. A step:
 1. crashes and restarts nodes at random (`crashPct`, `restartPct`);
 2. fires expired timers;
 3. delivers a random subset of in-flight messages (`deliverPct`) in shuffled

@@ -23,6 +23,7 @@ PROTOCOLS=${@:-$ALL}
 mkdir -p bin
 for p in $PROTOCOLS; do
 	[ -d "$p" ] && ls $p/*.v3 > /dev/null 2>&1 || continue
+	rm -f bin/$p
 	# The Virgil scripts print a harmless git warning outside the Virgil repo.
 	$V3C -output=bin -program-name=$p core/*.v3 $p/*.v3 $VIRGIL/lib/util/*.v3 2>&1 | grep -v "outside repository" || true
 	[ -x bin/$p ] || { echo "build of $p failed"; exit 1; }

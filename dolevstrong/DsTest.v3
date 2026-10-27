@@ -33,6 +33,7 @@ class DsSim extends Sim<DsMsg> {
 		if (opts.hasBug("distinct")) config.checkDistinct = false;
 		if (opts.hasBug("relay")) config.relay = false;
 		listener = opts.listener<DsMsg>();
+		controller = opts.controller<DsMsg>();
 		checker = DsChecker.new(this);
 		adversary = DsAdversary.new(this, faulty);
 		for (i < n) {
