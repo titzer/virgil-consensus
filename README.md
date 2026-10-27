@@ -18,15 +18,14 @@ runs, see [EXPLAINER.md](EXPLAINER.md).
 
 ```sh
 ./build.sh                    # native binaries bin/paxos, bin/raft, bin/dolevstrong, bin/pbft
-./build.sh test               # build, then run every protocol's scenarios and 10k fuzz runs
+./build.sh test               # build, then run every protocol's scenarios, 10k fuzz runs, and selftest
 ./build.sh raft               # build just one
 
 bin/paxos scenarios                     # run all scenarios
 bin/paxos scenarios -v preemption       # diagram of scenarios whose name contains "preemption"
 bin/paxos fuzz -runs=100000             # fuzz
-bin/paxos fuzz -bug=adopt               # fuzz a deliberately broken protocol; finds violations
-bin/paxos fuzz -seed=77 -runs=1 -v -bug=adopt   # replay one failing run as a diagram
-bin/paxos                               # usage, including the list of injectable bugs
+bin/paxos fuzz -seed=77 -runs=1 -v      # replay one fuzz run as a diagram
+bin/paxos                               # usage
 
 ./run.sh paxos scenarios -v happy       # same programs, in the interpreter
 ```
@@ -34,7 +33,7 @@ bin/paxos                               # usage, including the list of injectabl
 ### Interactive play
 
 ```sh
-./play.sh raft fuzz -seed=13 -bug=uptodate     # step through a fuzz run, one event at a time
+./play.sh raft fuzz -seed=13                   # step through a fuzz run, one event at a time
 ./play.sh paxos scenarios dueling              # play a randomized scenario
 ```
 
@@ -79,7 +78,7 @@ spaces. `-trace` prints a plain event log instead of a diagram.
 | `core/Sim.v3` | `Rng`, `Packet<M>`, `SimFaults`, `Sim<M>`, `SimListener<M>`, `TextLog<M>`. |
 | `core/Crypto.v3` | Simulated signatures: `Sig`, `KeyRing`, `Signer`, `Digest`. |
 | `core/Diagram.v3` | `Diagram<M>`: prints any simulation as a lifeline diagram. |
-| `core/Driver.v3` | Command-line driver: `TestOptions`, `Scenario`, `Suite`, scenario runner, fuzz loop. |
+| `core/Driver.v3` | Command-line driver: `TestOptions`, `Scenario`, `Suite`, `Injection`, scenario runner, fuzz loop, selftest. |
 | `core/Play.v3` | `Player<M>`: the interactive controller for `-play`. |
 | `<protocol>/<Name>.v3` | The protocol itself: its message ADT and node class. |
 | `<protocol>/<Name>Test.v3` | Simulation harness, safety and liveness checker, scenarios, fuzzer, `main`. |
@@ -113,9 +112,6 @@ tag is a keyed hash under the signer's secret. Only that node's `Signer`, or
 the adversary for a Byzantine node, holds the secret. Anyone can construct a
 `Sig` value, but a forged one fails `KeyRing.verify`.
 
-Every protocol defines injectable bugs (`-bug=NAME`), so you can check that
-the fuzzer and checkers actually catch real mistakes.
-
 ## Diagrams
 
 ```
@@ -146,12 +142,6 @@ proposed values are accepted, that at most one value is chosen, and that
 learners learn only the chosen value. Each fuzz run has a chaos phase, then
 the network stabilizes and every node must decide.
 
-| `-bug=` | Bug | Caught in |
-|---------|-----|-----------|
-| `acceptor` | acceptor state is not persisted | 1 in 12 runs |
-| `adopt` | proposer ignores values reported in promises | 1 in 8 runs |
-| `round` | proposer's ballot round is not persisted (ballot reuse) | 2 in 1M runs |
-
 ## Raft
 
 Messages (`type RaftMsg`): `RequestVote`, `Vote`, `AppendEntries`,
@@ -161,7 +151,7 @@ the vote and the log. There are two timers. The election timer restarts when
 a node hears from the leader or grants a vote, and the heartbeat timer drives
 the leader's AppendEntries. A leader commits only entries from its own term
 (Figure 8). A new leader appends a no-op by default; fuzz runs sometimes turn
-this off, which exposes more bugs. The harness injects client commands with
+this off, which makes Figure 8-style schedules more likely. The harness injects client commands with
 `sim.act()`.
 
 The checker enforces these properties:
@@ -172,13 +162,6 @@ The checker enforces these properties:
 
 For liveness, after stabilization every node must apply a newly submitted
 command.
-
-| `-bug=` | Bug | Caught in |
-|---------|-----|-----------|
-| `uptodate` | votes granted without the log up-to-date check | 1 in 16 runs |
-| `truncate` | follower truncates its log even when entries match | 1 in 180 runs |
-| `vote` | `votedFor` is not persisted, so a node can vote twice in a term | 1 in 320 runs |
-| `commit` | leader commits old-term entries by counting replicas (Figure 8) | 6 in 200k runs; always caught by the Figure 8 scenario |
 
 ## Dolev-Strong
 
@@ -207,13 +190,6 @@ only their keys. Its strategies:
 The checker enforces agreement, validity (if the sender is honest, everyone
 outputs its value) and termination. It also checks that no honest node accepts
 a forged chain.
-
-| `-bug=` | Bug | Caught in |
-|---------|-----|-----------|
-| `nosig` | signatures are not verified | 1 in 4 runs |
-| `rounds` | decide after f rounds instead of f+1 | 1 in 6 runs |
-| `relay` | newly extracted values are not relayed | 1 in 13 runs |
-| `distinct` | signers needn't be distinct, so a chain can be padded | 1 in 100 runs |
 
 ## PBFT
 
@@ -244,13 +220,6 @@ the same op, that only submitted ops are executed, and that no op is executed
 twice. For liveness, after stabilization every request must be executed by
 every honest replica, even though the adversary keeps misbehaving.
 
-| `-bug=` | Bug | Caught in |
-|---------|-----|-----------|
-| `prepared` | ViewChanges omit prepared certificates | 1 in 3 runs (mostly as liveness failures) |
-| `quorum` | 2f instead of 2f+1 for commit and new-view quorums | 1 in 38 runs |
-| `nosig` | signatures inside view-change certificates aren't checked | 1 in 56 runs |
-| `newview` | NewView accepted without recomputing its proposals | 1 in 1,260 runs |
-
 ## Verification
 
 Fuzz runs of each correct protocol in the final code, all with zero safety
@@ -263,3 +232,48 @@ Rosetta on an Apple M4 Pro.
 | Raft | 100k | 36s |
 | Dolev-Strong | 1M | 12s |
 | PBFT | 50k | 35s |
+
+## Fault injection
+
+The checkers are only as good as the mistakes they can catch. A fuzzer that
+reports "0 failures" proves little unless it would have noticed a real error.
+So each protocol has a few *injectable faults*. Each one is a deliberate,
+classic protocol mistake that removes one rule of the correct protocol. They
+are off by default and live in a small `...Injected` class next to each
+protocol (for example, `PaxosInjected`). Turning one on with `-inject=NAME`
+should make the checker report violations, which shows that the checks and
+the fuzzing are strong enough to notice.
+
+These are separate from the *fault models* the protocols are designed to
+survive: lost, duplicated and reordered messages, crashes, and Byzantine
+adversaries. Those are always on in fuzzing, and the correct protocols must
+handle them.
+
+```sh
+bin/paxos selftest                              # every injection: its scenarios, then fuzz until caught
+bin/raft fuzz -inject=skip-uptodate-check       # fuzz with one fault injected
+bin/raft fuzz -inject=skip-uptodate-check -seed=13 -runs=1 -v   # watch a counterexample
+./play.sh paxos fuzz -inject=ignore-promises    # try to break it by hand
+```
+
+`selftest` runs each injection's scripted scenarios, which must detect it,
+then fuzzes with the fault injected (up to `-runs`, default 20,000) until the
+checker catches it. The rates below come from 100k–1M fuzz runs each.
+
+| Protocol | `-inject=` | Fault | Caught in |
+|----------|-----------|-------|-----------|
+| Paxos | `forget-acceptor` | acceptor state is lost on a crash | 1 in 12 runs |
+| Paxos | `ignore-promises` | proposer ignores values reported in promises | 1 in 8 runs; also a scenario |
+| Paxos | `forget-round` | proposer's ballot round is lost on a crash (ballot reuse) | 2 in 1M runs |
+| Raft | `skip-uptodate-check` | votes granted without the log up-to-date check | 1 in 16 runs |
+| Raft | `truncate-on-match` | follower truncates its log even when entries match | 1 in 180 runs |
+| Raft | `forget-vote` | `votedFor` is lost on a crash, so a node can vote twice in a term | 1 in 320 runs |
+| Raft | `commit-old-terms` | leader commits old-term entries by counting replicas (Figure 8) | 6 in 200k runs; always caught by its scenario |
+| Dolev-Strong | `skip-sig-check` | signatures are not verified | 1 in 4 runs; also a scenario |
+| Dolev-Strong | `one-round-short` | decide after f rounds instead of f+1 | 1 in 6 runs; also a scenario |
+| Dolev-Strong | `skip-relay` | newly extracted values are not relayed | 1 in 13 runs |
+| Dolev-Strong | `skip-distinct-check` | signers needn't be distinct, so a chain can be padded | 1 in 100 runs; also a scenario |
+| PBFT | `omit-prepared` | ViewChanges omit prepared certificates | 1 in 3 runs (mostly as liveness failures) |
+| PBFT | `weak-quorum` | 2f instead of 2f+1 for commit and new-view quorums | 1 in 38 runs |
+| PBFT | `skip-cert-sigs` | signatures inside view-change certificates aren't checked | 1 in 56 runs; also a scenario |
+| PBFT | `trust-newview` | NewView accepted without recomputing its proposals | 1 in 1,260 runs |

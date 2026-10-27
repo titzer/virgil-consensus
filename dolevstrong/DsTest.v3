@@ -1,12 +1,7 @@
 // Dolev-Strong simulation harness, Byzantine adversary, checker, scenarios, and fuzzer.
 
 def main(args: Array<string>) -> int {
-	return Driver.run(DsSuite.new("dolevstrong", [
-		("rounds", "decide after f rounds instead of f+1"),
-		("nosig", "don't verify signatures"),
-		("distinct", "don't require distinct signers (chains can be padded)"),
-		("relay", "don't relay newly extracted values")
-	]), args);
+	return Driver.run(DsSuite.new("dolevstrong"), args);
 }
 
 def dsRender(keys: KeyRing, m: DsMsg, buf: StringBuilder) -> StringBuilder {
@@ -18,7 +13,7 @@ class DsSim extends Sim<DsMsg> {
 	def keys: KeyRing;
 	def f: int;
 	def sender: int;
-	def config = DsConfig.new();
+	def inject = DsInjected.new();
 	var checker: DsChecker;
 	var adversary: DsAdversary;
 
@@ -28,10 +23,10 @@ class DsSim extends Sim<DsMsg> {
 		addTimer(1, 1);		// fires at the start of every round
 		setQuiet(0);
 		announceRounds = true;
-		if (opts.hasBug("rounds")) config.extraRound = false;
-		if (opts.hasBug("nosig")) config.checkSigs = false;
-		if (opts.hasBug("distinct")) config.checkDistinct = false;
-		if (opts.hasBug("relay")) config.relay = false;
+		if (opts.injected("one-round-short")) inject.oneRoundShort = true;
+		if (opts.injected("skip-sig-check")) inject.skipSigCheck = true;
+		if (opts.injected("skip-distinct-check")) inject.skipDistinctCheck = true;
+		if (opts.injected("skip-relay")) inject.skipRelay = true;
 		listener = opts.listener<DsMsg>();
 		controller = opts.controller<DsMsg>();
 		checker = DsChecker.new(this);
@@ -41,7 +36,7 @@ class DsSim extends Sim<DsMsg> {
 				byzantine[i] = true;
 				nodes[i] = DsByzNode.new(i, n, adversary);
 			} else {
-				var node = DsNode.new(i, n, sender, f, keys, keys.signer(i), config, checker);
+				var node = DsNode.new(i, n, sender, f, keys, keys.signer(i), inject, checker);
 				node.input = input;
 				nodes[i] = node;
 			}
@@ -386,10 +381,10 @@ def dsExpect(sim: DsSim, expected: int) -> string {
 	return null;
 }
 
-// Expects a run with a protocol bug to be caught by the checker.
+// Expects a run with an injected fault to be caught by the checker.
 def dsExpectViolation(opts: TestOptions, sim: DsSim) -> string {
 	var err = sim.checker.error();
-	if (err == null) return "bug was not detected";
+	if (err == null) return "the injected fault was not detected";
 	if (opts.verbose) System.puts(StringBuilder.new().puts("  (detected: ").puts(err).puts(")\n").toString());
 	return null;
 }
@@ -422,18 +417,18 @@ def dsLateReleaseDefeated(opts: TestOptions) -> string {
 	return dsLateRelease(opts, false);
 }
 // The same attack, but nodes decide after only f rounds: N3 never hears about 2.
-def dsLateReleaseBug(opts: TestOptions) -> string {
+def dsLateReleaseInjected(opts: TestOptions) -> string {
 	return dsLateRelease(opts, true);
 }
-def dsLateRelease(opts: TestOptions, buggy: bool) -> string {
+def dsLateRelease(opts: TestOptions, faulty: bool) -> string {
 	var sim = dsNewSim(opts, 4, 4, 2, 0, [0, 1], 0);
-	if (buggy) sim.config.extraRound = false;
+	if (faulty) sim.inject.oneRoundShort = true;
 	var a = sim.adversary;
 	a.strategy = DsStrategy.LATE;
 	a.releaseRound = 2;
 	a.target = 2;
 	sim.run();
-	if (buggy) return dsExpectViolation(opts, sim);
+	if (faulty) return dsExpectViolation(opts, sim);
 	return dsExpect(sim, 0);
 }
 
@@ -442,16 +437,16 @@ def dsForgeryRejected(opts: TestOptions) -> string {
 	return dsForgery(opts, false);
 }
 // Without signature checks, the forged chain is accepted.
-def dsForgeryBug(opts: TestOptions) -> string {
+def dsForgeryInjected(opts: TestOptions) -> string {
 	return dsForgery(opts, true);
 }
-def dsForgery(opts: TestOptions, buggy: bool) -> string {
+def dsForgery(opts: TestOptions, faulty: bool) -> string {
 	var sim = dsNewSim(opts, 5, 4, 1, 0, [3], 7);
-	if (buggy) sim.config.checkSigs = false;
+	if (faulty) sim.inject.skipSigCheck = true;
 	var a = sim.adversary;
 	a.strategy = DsStrategy.FORGE;
 	sim.run();
-	if (buggy) return dsExpectViolation(opts, sim);
+	if (faulty) return dsExpectViolation(opts, sim);
 	return dsExpect(sim, 7);
 }
 
@@ -460,19 +455,19 @@ def dsForgery(opts: TestOptions, buggy: bool) -> string {
 def dsPaddingRejected(opts: TestOptions) -> string {
 	return dsPadding(opts, false);
 }
-def dsPaddingBug(opts: TestOptions) -> string {
+def dsPaddingInjected(opts: TestOptions) -> string {
 	return dsPadding(opts, true);
 }
-def dsPadding(opts: TestOptions, buggy: bool) -> string {
+def dsPadding(opts: TestOptions, faulty: bool) -> string {
 	var sim = dsNewSim(opts, 6, 4, 1, 0, [0], 0);
-	if (buggy) sim.config.checkDistinct = false;
+	if (faulty) sim.inject.skipDistinctCheck = true;
 	var a = sim.adversary;
 	a.strategy = DsStrategy.LATE;
 	a.releaseRound = 2;
 	a.target = 2;
 	a.padMode = 1;
 	sim.run();
-	if (buggy) return dsExpectViolation(opts, sim);
+	if (faulty) return dsExpectViolation(opts, sim);
 	return dsExpect(sim, 1);
 }
 
@@ -489,19 +484,27 @@ def dsMaxFaults(opts: TestOptions) -> string {
 }
 
 class DsSuite extends Suite {
-	new(name: string, bugs: Array<(string, string)>) super(name, bugs) { }
+	new(name: string) super(name) { }
 
+	def injections() -> Array<Injection> {
+		return [
+			Injection("one-round-short", "decide after f rounds instead of f+1",
+				[Scenario("late release breaks agreement", dsLateReleaseInjected)]),
+			Injection("skip-sig-check", "don't verify signatures",
+				[Scenario("forged chain is accepted", dsForgeryInjected)]),
+			Injection("skip-distinct-check", "don't require distinct signers (chains can be padded)",
+				[Scenario("padded chain is accepted", dsPaddingInjected)]),
+			Injection("skip-relay", "don't relay newly extracted values", [])
+		];
+	}
 	def scenarios() -> Array<Scenario> {
 		return [
 			Scenario("honest sender, all honest", dsHonestAll),
 			Scenario("honest sender, silent faulty nodes", dsSilentFaulty),
 			Scenario("equivocating faulty sender", dsEquivocatingSender),
 			Scenario("late-release attack defeated by round f+1", dsLateReleaseDefeated),
-			Scenario("BUG(rounds): late release breaks agreement", dsLateReleaseBug),
 			Scenario("forged signature chain rejected", dsForgeryRejected),
-			Scenario("BUG(nosig): forged chain accepted", dsForgeryBug),
 			Scenario("chain padded with repeated signer rejected", dsPaddingRejected),
-			Scenario("BUG(distinct): padded chain accepted", dsPaddingBug),
 			Scenario("f = n-1, late release with 3 faulty nodes", dsMaxFaults)
 		];
 	}

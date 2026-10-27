@@ -5,12 +5,7 @@
 // network may drop, duplicate, and reorder messages during the chaos phase.
 
 def main(args: Array<string>) -> int {
-	return Driver.run(PbftSuite.new("pbft", [
-		("quorum", "use 2f instead of 2f+1 for commit and new-view quorums"),
-		("nosig", "skip signature checks inside view-change certificates"),
-		("newview", "accept a NewView without recomputing its proposals"),
-		("prepared", "ViewChange messages omit prepared certificates")
-	]), args);
+	return Driver.run(PbftSuite.new("pbft"), args);
 }
 
 def renderPbft(m: PbftMsg, buf: StringBuilder) -> StringBuilder {
@@ -42,7 +37,7 @@ def pbftRequest(op: int, node: Node<PbftMsg>) {
 
 class PbftSim extends Sim<PbftMsg> {
 	def f: int;
-	def config = PbftConfig.new();
+	def inject = PbftInjected.new();
 	def VIEWCHANGE = 0;
 	def submitted = Vector<int>.new();
 	var keys: KeyRing;
@@ -54,14 +49,14 @@ class PbftSim extends Sim<PbftMsg> {
 		listener = opts.listener<PbftMsg>();
 		controller = opts.controller<PbftMsg>();
 		crashable = false;	// honest replicas don't persist state, so crashes are outside the model
-		if (opts.hasBug("quorum")) config.weakQuorum = true;
-		if (opts.hasBug("nosig")) config.skipCertSigs = true;
-		if (opts.hasBug("newview")) config.trustNewView = true;
-		if (opts.hasBug("prepared")) config.omitPrepared = true;
+		if (opts.injected("weak-quorum")) inject.weakQuorum = true;
+		if (opts.injected("skip-cert-sigs")) inject.skipCertSigs = true;
+		if (opts.injected("trust-newview")) inject.trustNewView = true;
+		if (opts.injected("omit-prepared")) inject.omitPrepared = true;
 		keys = KeyRing.new(n, rng);
 		checker = PbftChecker.new(this);
 		adversary = PbftAdversary.new(this);
-		for (i < n) nodes[i] = PbftReplica.new(i, n, f, config, keys, keys.signer(i), checker);
+		for (i < n) nodes[i] = PbftReplica.new(i, n, f, inject, keys, keys.signer(i), checker);
 	}
 	def replica(i: int) -> PbftReplica {
 		return PbftReplica.!(nodes[i]);
@@ -322,8 +317,17 @@ class PbftEvil extends PbftHook {
 }
 
 class PbftSuite extends Suite {
-	new(name: string, bugs: Array<(string, string)>) super(name, bugs) { }
+	new(name: string) super(name) { }
 
+	def injections() -> Array<Injection> {
+		return [
+			Injection("weak-quorum", "use 2f instead of 2f+1 for commit and new-view quorums", []),
+			Injection("skip-cert-sigs", "skip signature checks inside view-change certificates",
+				[Scenario("forged certificate is accepted", pbftForgedAcceptedInjected)]),
+			Injection("trust-newview", "accept a NewView without recomputing its proposals", []),
+			Injection("omit-prepared", "ViewChange messages omit prepared certificates", [])
+		];
+	}
 	def scenarios() -> Array<Scenario> {
 		return [
 			Scenario("normal case", pbftNormalCase),
@@ -332,7 +336,6 @@ class PbftSuite extends Suite {
 			Scenario("equivocating primary cannot commit two ops", pbftEquivocatingPrimary),
 			Scenario("view change preserves a prepared request", pbftPreservesPrepared),
 			Scenario("forged certificate in a ViewChange is rejected", pbftForgedRejected),
-			Scenario("BUG(nosig): forged certificate is accepted", pbftForgedAcceptedBug),
 			Scenario("lossy network with Byzantine replicas converges", pbftLossy)
 		];
 	}
@@ -536,16 +539,16 @@ def pbftForgedRejected(opts: TestOptions) -> string {
 	if (err != null) return err;
 	return null;
 }
-// Same scenario, with the bug: replicas skip signature checks inside certificates.
-def pbftForgedAcceptedBug(opts: TestOptions) -> string {
+// Same scenario, with an injected fault: replicas skip signature checks inside certificates.
+def pbftForgedAcceptedInjected(opts: TestOptions) -> string {
 	var err = pbftForged(opts, true);
-	if (err == null) return "bug was not detected";
+	if (err == null) return "the injected fault was not detected";
 	if (opts.verbose) System.puts(StringBuilder.new().puts("  (detected: ").puts(err).puts(")\n").toString());
 	return null;
 }
-def pbftForged(opts: TestOptions, buggy: bool) -> string {
+def pbftForged(opts: TestOptions, faulty: bool) -> string {
 	var sim = pbftScripted(opts, 1, 5);
-	if (buggy) sim.config.skipCertSigs = true;
+	if (faulty) sim.inject.skipCertSigs = true;
 	sim.makeFaulty(3, PBFT_FORGE, 0);
 	sim.adversary.forgeOp = 9999;
 	sim.submit(101);
@@ -557,7 +560,7 @@ def pbftForged(opts: TestOptions, buggy: bool) -> string {
 	sim.deliverIf(pbftFromTo(3, 1, _));		// the new primary N1 sees the forgery first
 	sim.kick(2);
 	sim.deliverAll();
-	if (!buggy) {
+	if (!faulty) {
 		for (i < 3) {
 			var vcs = sim.replica(i).vcs[1];
 			if (vcs == null || !vcs.has[3]) continue;

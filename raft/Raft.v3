@@ -64,14 +64,19 @@ class RaftObserver {
 	def onApply(node: int, index: int, entry: RaftEntry) { }
 }
 
-// Configuration knobs; the defaults are the correct protocol.
-// Turning them off injects bugs, which is useful for testing the fuzzer.
+// Protocol options.
 class RaftConfig {
-	var persistVote = true;		// votedFor survives crashes
-	var upToDateCheck = true;	// only vote for candidates whose log is at least as up-to-date
-	var commitCurrentTerm = true;	// leader only commits entries of its own term by counting
-	var truncateOnMatch = false;	// BUG: follower always truncates its log after prevIndex
-	var noopOnElect = true;		// a new leader appends a no-op entry (not a bug if off)
+	var noopOnElect = true;		// a new leader appends a no-op entry (either setting is correct)
+}
+
+// Fault injection, for testing that the checker catches protocol mistakes
+// (see "Fault injection" in README.md). Every flag is off by default, which
+// is the correct protocol.
+class RaftInjected {
+	var forgetVote = false;		// votedFor is lost on a crash (double voting)
+	var skipUpToDateCheck = false;	// grant votes without the log up-to-date check
+	var commitOldTerms = false;	// leader commits old-term entries by counting replicas (Figure 8)
+	var truncateOnMatch = false;	// follower truncates its log after prevIndex even when entries match
 }
 
 // State that survives a crash (i.e. lives on simulated stable storage).
@@ -83,6 +88,7 @@ class RaftStable {
 
 class RaftNode extends Node<RaftMsg> {
 	def config: RaftConfig;
+	def inject: RaftInjected;
 	def observer: RaftObserver;
 	def stable = RaftStable.new();
 
@@ -96,7 +102,7 @@ class RaftNode extends Node<RaftMsg> {
 	private var nextIndex: Array<int>;
 	private var matchIndex: Array<int>;
 
-	new(id: int, n: int, config, observer) super(id, n) {
+	new(id: int, n: int, config, inject, observer) super(id, n) {
 		reset();
 	}
 
@@ -117,7 +123,7 @@ class RaftNode extends Node<RaftMsg> {
 	}
 	// Discards all volatile state, as if the node had crashed and restarted.
 	def onRestart() {
-		if (!config.persistVote) stable.votedFor = -1;
+		if (inject.forgetVote) stable.votedFor = -1;
 		reset();
 		stopTimer(RaftTimer.HEARTBEAT);
 	}
@@ -184,7 +190,7 @@ class RaftNode extends Node<RaftMsg> {
 					return;
 				}
 				var log = stable.log;
-				if (config.truncateOnMatch) log.resize(prev);
+				if (inject.truncateOnMatch) log.resize(prev);
 				for (k < entries.length) {
 					var index = prev + 1 + k, e = entries[k];
 					if (index <= log.length) {
@@ -223,7 +229,7 @@ class RaftNode extends Node<RaftMsg> {
 		}
 	}
 	private def upToDate(lli: int, llt: int) -> bool {
-		if (!config.upToDateCheck) return true;
+		if (inject.skipUpToDateCheck) return true;
 		var myTerm = termAt(lastIndex());
 		return llt > myTerm || (llt == myTerm && lli >= lastIndex());
 	}
@@ -303,7 +309,7 @@ class RaftNode extends Node<RaftMsg> {
 	// Commits the highest index replicated on a majority (of the current term, per Figure 8).
 	private def advanceCommit() {
 		for (index = lastIndex(); index > commitIndex; index--) {
-			if (config.commitCurrentTerm && termAt(index) != term()) break;
+			if (!inject.commitOldTerms && termAt(index) != term()) break;
 			var count = 0;
 			for (i < n) if (matchIndex[i] >= index) count++;
 			if (count >= majority()) {

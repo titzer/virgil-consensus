@@ -3,9 +3,9 @@
 This repository holds four classic agreement protocols, each implemented in
 Virgil and run inside a deterministic simulator. Each protocol comes with a
 checker that knows exactly what "correct" means, and with a fuzzer that
-attacks it. Every protocol also has a few deliberately broken variants. The
-idea is not just that the protocols work, but that you can watch why each rule
-is there by switching it off and seeing what breaks.
+attacks it. Every protocol also lets you inject a few classic mistakes
+(`-inject=NAME`). The idea is not just that the protocols work, but that you
+can watch why each rule is there by switching it off and seeing what breaks.
 
 | Protocol | Problem | Faults tolerated | Network | Replicas needed |
 |----------|---------|------------------|---------|-----------------|
@@ -65,7 +65,7 @@ network, the clock and the randomness with one deterministic object:
   is delivered in the next round, and a `[1,1]` timer marks each round.
 - A crash keeps only the state the protocol explicitly marked as persistent,
   such as `PaxosStable` or `RaftStable`. Forgetting to persist something is
-  one of the injectable bugs.
+  one of the injectable faults.
 
 **Signatures without cryptography** (`core/Crypto.v3`). Channels are
 authenticated, so a packet's `src` is always genuine. But Byzantine protocols
@@ -95,12 +95,13 @@ Each protocol has three layers of testing:
    makes sense: no protocol can guarantee progress while the network is
    adversarial (the FLP impossibility result).
 
-**Injected bugs check the checkers.** A fuzzer that never fails proves nothing
-unless it can catch real mistakes. Each protocol exposes `-bug=NAME` switches
-that remove one rule. If the fuzzer catches that variant, the rule matters and
-the tests are strong enough to notice. Detection rates appear below. Some bugs
-take a million runs to show up, which is exactly why these protocols are
-famously subtle.
+**Fault injection checks the checkers.** A fuzzer that never fails proves
+nothing unless it can catch real mistakes. Each protocol has `-inject=NAME`
+switches that remove one rule, and `bin/<protocol> selftest` checks that each
+resulting violation is caught. If the fuzzer catches it, the rule matters and
+the tests are strong enough to notice. Some injected faults take a million
+runs to show up, which is exactly why these protocols are famously subtle.
+The full list, with detection rates, is under "Fault injection" in README.md.
 
 ---
 
@@ -138,11 +139,11 @@ round    N0    N1    N2    N3    N4
           #     |     |     |     |    N0 learns 10
 ```
 
-With `-bug=adopt`, N4 proposes its own 20, and the checker reports
+With `-inject=ignore-promises`, N4 proposes its own 20, and the checker reports
 `two values chosen: 10 and 20`. Every other rule matters too:
-- `-bug=acceptor`: an acceptor that forgets its promise after a crash.
+- `-inject=forget-acceptor`: an acceptor that forgets its promise after a crash.
   Caught in about 1 in 12 runs.
-- `-bug=round`: a proposer that forgets its ballot counter after a crash, so
+- `-inject=forget-round`: a proposer that forgets its ballot counter after a crash, so
   it reuses a ballot number with a different value. Caught 2 times in a
   million runs, because it needs a crash at just the wrong moment.
 
@@ -165,7 +166,7 @@ same commands in the same order.
 1. *Voting restriction.* Grant a vote only if the candidate's log is at least
    as up to date as yours. Since committed entries are on a majority, and any
    winning majority overlaps that one, every new leader has every committed
-   entry. Without this rule (`-bug=uptodate`), a node with a stale log can win
+   entry. Without this rule (`-inject=skip-uptodate-check`), a node with a stale log can win
    and overwrite committed entries. Caught in 1 in 16 runs.
 2. *Only count replicas for current-term entries* (Figure 8 of the Raft
    paper). An entry from an older term can be on a majority and still be
@@ -175,10 +176,11 @@ same commands in the same order.
 The Figure 8 scenario (`bin/raft scenarios -v "figure 8"`) builds the
 counterexample step by step. N0, leader of term 2, puts entry `2:2` on N0 and
 N1 only. N4 becomes leader of term 3 and writes `3:3` locally. N0 returns as
-leader of term 4 and spreads `2:2` to a majority. Under `-bug=commit`, N0
-counts replicas and commits `2:2`. Then N4 is elected again: its last log
-entry, `3:3`, has a higher term than `2:2`, so the up-to-date rule lets it
-win. It overwrites `2:2`:
+leader of term 4 and spreads `2:2` to a majority. With
+`-inject=commit-old-terms`, N0 counts replicas and commits `2:2`. Then N4 is
+elected again: its last log entry, `3:3`, has a higher term than `2:2`, so the
+up-to-date rule lets it win. It overwrites `2:2`
+(`bin/raft selftest -v commit-old-terms` plays this exact script):
 
 ```
           :     |     |     |     L    N4 becomes leader of term 5
@@ -190,13 +192,13 @@ win. It overwrites `2:2`:
 The correct protocol refuses to commit `2:2` in term 4, so N4 overwriting it
 is legal. The usual fix is for a new leader to append a no-op entry, which
 commits everything before it; Raft does that here by default. Fuzz runs
-sometimes turn the no-op off, because the no-op hides bugs: with it on, the
+sometimes turn the no-op off, because the no-op hides this mistake: with it on, the
 old entry usually gets committed legitimately.
 
-The other bugs:
-- `-bug=vote`: forgetting `votedFor` after a crash, so a node votes twice in
+Other injectable mistakes:
+- `-inject=forget-vote`: forgetting `votedFor` after a crash, so a node votes twice in
   one term. Caught in 1 in 320 runs.
-- `-bug=truncate`: truncating the log on every AppendEntries, even when the
+- `-inject=truncate-on-match`: truncating the log on every AppendEntries, even when the
   entries match. A delayed, duplicate message then erases committed entries.
   Caught in 1 in 180 runs.
 
@@ -243,15 +245,13 @@ round    B0    B1    N2    N3
           |     |     |     #    N3 decides bottom        <- agreement
 ```
 
-With `-bug=rounds`, nodes decide one round early. N2 has extracted 2, but N3
+With `-inject=one-round-short`, nodes decide one round early. N2 has extracted 2, but N3
 never hears about it, so N2 outputs bottom while N3 outputs 1: agreement is
-broken. Caught in 1 in 6 fuzz runs. The other bugs:
-
-| Bug | What the adversary does | Caught in |
-|-----|------------------------|-----------|
-| `-bug=nosig` | forges honest nodes' signatures | 1 in 4 runs |
-| `-bug=distinct` | pads a chain by repeating its own signature | 1 in 100 runs |
-| `-bug=relay` | relies on honest nodes not relaying | 1 in 13 runs |
+broken. Caught in 1 in 6 fuzz runs. Each of the other rules has an injection
+too:
+- `skip-sig-check`: the adversary forges honest nodes' signatures.
+- `skip-distinct-check`: it pads a chain by repeating its own signature.
+- `skip-relay`: it relies on honest nodes not passing values on.
 
 ## PBFT: Byzantine agreement without synchrony
 
@@ -310,14 +310,13 @@ The adversary attacks every step of this:
 - They also send ViewChanges whose "certificates" carry forged Prepares from
   honest replicas.
 
-The bugs:
-
-| Bug | Effect | Caught in |
-|-----|--------|-----------|
-| `-bug=prepared` | ViewChanges drop their certificates, so prepared requests can be replaced. This shows up mostly as replicas getting stuck. | 1 in 3 runs |
-| `-bug=quorum` | Quorums of 2f no longer overlap in an honest replica. | 1 in 38 runs |
-| `-bug=nosig` | Forged certificates are believed. | 1 in 56 runs |
-| `-bug=newview` | A Byzantine new primary's NewView is trusted without being recomputed. This needs a faulty replica as the next primary. | 1 in 1,260 runs |
+Each defense can be switched off:
+- `-inject=omit-prepared`: ViewChanges drop their certificates, so prepared
+  requests can be replaced. This mostly shows up as replicas getting stuck.
+- `-inject=weak-quorum`: quorums of 2f no longer overlap in an honest replica.
+- `-inject=skip-cert-sigs`: forged certificates are believed.
+- `-inject=trust-newview`: a Byzantine new primary's NewView is trusted without
+  being recomputed. This needs a faulty replica as the next primary.
 
 ---
 
@@ -352,19 +351,19 @@ in-flight message to deliver or drop instead. You can also crash a node or
 fire its timer. Try building the Raft Figure 8 counterexample by hand, or
 starving a PBFT primary until the replicas give up on it. The checker is
 still watching, so the moment you find an interleaving that breaks a rule
-(with a `-bug=` switched on, if you want it to be possible), the diagram
+(with an `-inject=` fault switched on, if you want it to be possible), the diagram
 says so.
 
 ## Things to try
 
 ```sh
 ./build.sh
-bin/paxos scenarios -v "BUG"                    # watch Paxos break without the adopt rule
-bin/raft fuzz -bug=uptodate                     # find a stale-leader counterexample, then replay its seed with -v
+bin/paxos selftest -v ignore-promises          # watch Paxos break without the adopt rule
+bin/raft fuzz -inject=skip-uptodate-check      # find a stale-leader counterexample, then replay its seed with -v
 bin/dolevstrong scenarios -v "f = n-1"          # 3 of 4 nodes are traitors, and it still works
 bin/pbft scenarios -v "two faulty primaries"    # two view changes in a row (f=2)
 bin/pbft fuzz -runs=100000                      # leave it running; it should print 0 failures
-./play.sh raft fuzz -seed=13 -bug=uptodate      # step through a counterexample, or change its course
+./play.sh raft fuzz -seed=13 -inject=skip-uptodate-check   # step through a counterexample
 ```
 
 To change a protocol, edit `<protocol>/<Name>.v3`, rebuild, and run

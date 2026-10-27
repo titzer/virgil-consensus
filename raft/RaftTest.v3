@@ -1,12 +1,7 @@
 // Raft simulation harness, safety checker, scenarios, and fuzzer.
 
 def main(args: Array<string>) -> int {
-	return Driver.run(RaftSuite.new("raft", [
-		("vote", "votedFor is not persisted across crashes (double voting)"),
-		("uptodate", "votes are granted without the log up-to-date check"),
-		("commit", "leader commits old-term entries by counting replicas (Figure 8)"),
-		("truncate", "follower truncates its log after prevIndex even when entries match")
-	]), args);
+	return Driver.run(RaftSuite.new("raft"), args);
 }
 
 def renderRaft(m: RaftMsg, buf: StringBuilder) -> StringBuilder {
@@ -23,6 +18,7 @@ def raftSubmit(cmd: int, node: Node<RaftMsg>) {
 
 class RaftSim extends Sim<RaftMsg> {
 	def config = RaftConfig.new();
+	def inject = RaftInjected.new();
 	var checker: RaftChecker;
 	var nextCmd = 1;
 
@@ -32,11 +28,11 @@ class RaftSim extends Sim<RaftMsg> {
 		checker = RaftChecker.new(this);
 		listener = opts.listener<RaftMsg>();
 		controller = opts.controller<RaftMsg>();
-		if (opts.hasBug("vote")) config.persistVote = false;
-		if (opts.hasBug("uptodate")) config.upToDateCheck = false;
-		if (opts.hasBug("commit")) config.commitCurrentTerm = false;
-		if (opts.hasBug("truncate")) config.truncateOnMatch = true;
-		for (i < n) nodes[i] = RaftNode.new(i, n, config, checker);
+		if (opts.injected("forget-vote")) inject.forgetVote = true;
+		if (opts.injected("skip-uptodate-check")) inject.skipUpToDateCheck = true;
+		if (opts.injected("commit-old-terms")) inject.commitOldTerms = true;
+		if (opts.injected("truncate-on-match")) inject.truncateOnMatch = true;
+		for (i < n) nodes[i] = RaftNode.new(i, n, config, inject, checker);
 	}
 	def node(i: int) -> RaftNode {
 		return RaftNode.!(nodes[i]);
@@ -140,8 +136,17 @@ class RaftChecker extends RaftObserver {
 }
 
 class RaftSuite extends Suite {
-	new(name: string, bugs: Array<(string, string)>) super(name, bugs) { }
+	new(name: string) super(name) { }
 
+	def injections() -> Array<Injection> {
+		return [
+			Injection("forget-vote", "votedFor is lost on a crash (double voting)", []),
+			Injection("skip-uptodate-check", "votes are granted without the log up-to-date check", []),
+			Injection("commit-old-terms", "leader commits old-term entries by counting replicas (Figure 8)",
+				[Scenario("figure 8 overwrites a committed entry", injectedFigure8Detected)]),
+			Injection("truncate-on-match", "follower truncates its log after prevIndex even when entries match", [])
+		];
+	}
 	def scenarios() -> Array<Scenario> {
 		return [
 			Scenario("election and replication", basicReplication),
@@ -151,7 +156,6 @@ class RaftSuite extends Suite {
 			Scenario("split vote resolves", splitVote),
 			Scenario("stale leader steps down", staleLeader),
 			Scenario("figure 8: old-term entry is not committed by counting", figure8),
-			Scenario("BUG(commit): figure 8 violates safety", buggyFigure8Detected),
 			Scenario("lossy, duplicating, reordering network", lossyNetwork),
 			Scenario("crashing nodes and lossy network", crashyNetwork)
 		];
@@ -175,7 +179,7 @@ class RaftSuite extends Suite {
 		sim.setTimer(RaftTimer.HEARTBEAT, hb, hb);
 		var submitPct = rng.between(1, 50);
 		// A new leader's no-op entry is optional; without it, old-term entries linger
-		// uncommitted longer, which exposes Figure 8-style bugs.
+		// uncommitted longer, which exposes Figure 8-style mistakes.
 		sim.config.noopOnElect = rng.chance(50);
 		var chaos = rng.between(0, opts.chaos);
 		var config = StringBuilder.new()
@@ -420,16 +424,16 @@ def staleLeader(opts: TestOptions) -> string {
 def figure8(opts: TestOptions) -> string {
 	return runFigure8(opts, false);
 }
-def buggyFigure8Detected(opts: TestOptions) -> string {
+def injectedFigure8Detected(opts: TestOptions) -> string {
 	var err = runFigure8(opts, true);
-	if (err == null) return "bug was not detected";
+	if (err == null) return "the injected fault was not detected";
 	if (opts.verbose) System.puts(StringBuilder.new().puts("  (detected: ").puts(err).puts(")\n").toString());
 	return null;
 }
-def runFigure8(opts: TestOptions, buggy: bool) -> string {
+def runFigure8(opts: TestOptions, faulty: bool) -> string {
 	var sim = newSim(opts, 5, 7);
 	sim.config.noopOnElect = false;
-	if (buggy) sim.config.commitCurrentTerm = false;
+	if (faulty) sim.inject.commitOldTerms = true;
 	// Setup: node 0 leads term 1 and commits entry 1 everywhere.
 	sim.elect(0);
 	exchangeAll(sim);

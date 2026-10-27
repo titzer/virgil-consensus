@@ -78,13 +78,14 @@ class DsObserver {
 	def onDecide(node: int, value: int) { }
 }
 
-// Configuration knobs; the defaults are the correct protocol.
-// Turning them off injects bugs, which is useful for testing the fuzzer.
-class DsConfig {
-	var extraRound = true;		// run f+1 rounds (false: only f)
-	var checkSigs = true;		// verify signatures
-	var checkDistinct = true;	// require distinct signers
-	var relay = true;		// relay newly extracted values
+// Fault injection, for testing that the checker catches protocol mistakes
+// (see "Fault injection" in README.md). Every flag is off by default, which
+// is the correct protocol.
+class DsInjected {
+	var oneRoundShort = false;	// decide after f rounds instead of f+1
+	var skipSigCheck = false;	// don't verify signatures
+	var skipDistinctCheck = false;	// don't require distinct signers (chains can be padded)
+	var skipRelay = false;		// don't relay newly extracted values
 }
 
 class DsNode extends Node<DsMsg> {
@@ -92,18 +93,18 @@ class DsNode extends Node<DsMsg> {
 	def f: int;			// number of faults tolerated
 	def keys: KeyRing;		// for verification only
 	def signer: Signer;		// this node's own signing key
-	def config: DsConfig;
+	def inject: DsInjected;
 	def observer: DsObserver;
 	var input: int;			// the sender's value to broadcast
 	var round: int;			// current round, counted by timer firings
 	var decided = -1;		// output value (0 = bottom), -1 if not yet decided
 	def extracted = Vector<int>.new();
 
-	new(id: int, n: int, sender, f, keys, signer, config, observer) super(id, n) { }
+	new(id: int, n: int, sender, f, keys, signer, inject, observer) super(id, n) { }
 
 	// The round at whose start a node outputs its decision.
 	def decideRound() -> int {
-		return if(config.extraRound, f + 2, f + 1);
+		return if(inject.oneRoundShort, f + 1, f + 2);
 	}
 	def onTimer(kind: int) {
 		if (decided >= 0) return;
@@ -126,7 +127,7 @@ class DsNode extends Node<DsMsg> {
 				for (i < extracted.length) if (extracted[i] == v) return;
 				if (extracted.length >= 2) return; // two values suffice to output bottom
 				extract(v, sigs);
-				if (config.relay) broadcast(DsMsg.Chain(v, DsChain.extend(v, sigs, signer)));
+				if (!inject.skipRelay) broadcast(DsMsg.Chain(v, DsChain.extend(v, sigs, signer)));
 			}
 		}
 	}
@@ -134,8 +135,8 @@ class DsNode extends Node<DsMsg> {
 		if (v <= 0) return false;
 		if (sigs.length < round || sigs.length == 0) return false;
 		if (sigs[0].signer != sender) return false;
-		if (config.checkDistinct && !DsChain.distinct(sigs)) return false;
-		if (config.checkSigs && !DsChain.verified(v, sigs, keys)) return false;
+		if (!inject.skipDistinctCheck && !DsChain.distinct(sigs)) return false;
+		if (!inject.skipSigCheck && !DsChain.verified(v, sigs, keys)) return false;
 		return true;
 	}
 	private def extract(v: int, sigs: Array<Sig>) {

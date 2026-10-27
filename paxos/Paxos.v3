@@ -44,12 +44,13 @@ class PaxosObserver {
 	def onLearned(node: int, value: int) { }
 }
 
-// Configuration knobs; the defaults are the correct protocol.
-// Turning them off injects bugs, which is useful for testing the fuzzer.
-class PaxosConfig {
-	var persistAcceptor = true;	// acceptor state survives crashes
-	var persistRound = true;	// proposer's ballot round survives crashes
-	var adoptAccepted = true;	// proposer adopts highest accepted value from promises
+// Fault injection, for testing that the checker catches protocol mistakes
+// (see "Fault injection" in README.md). Every flag is off by default, which
+// is the correct protocol.
+class PaxosInjected {
+	var forgetAcceptor = false;	// acceptor state is lost on a crash
+	var forgetRound = false;	// proposer's ballot round is lost on a crash
+	var ignorePromises = false;	// proposer ignores accepted values reported in promises
 }
 
 // State that survives a crash (i.e. lives on simulated stable storage).
@@ -63,7 +64,7 @@ class PaxosStable {
 private enum Phase { IDLE, PREPARE, ACCEPT }
 
 class PaxosNode extends Node<PaxosMsg> {
-	def config: PaxosConfig;
+	def inject: PaxosInjected;
 	def observer: PaxosObserver;
 	var stable = PaxosStable.new();
 
@@ -82,7 +83,7 @@ class PaxosNode extends Node<PaxosMsg> {
 	private var learnBallot: Array<int>;	// per acceptor: highest Accepted ballot seen
 	private var learnValue: Array<int>;	// per acceptor: value of that ballot
 
-	new(id: int, n: int, config, observer) super(id, n) {
+	new(id: int, n: int, inject, observer) super(id, n) {
 		reset();
 	}
 
@@ -93,12 +94,12 @@ class PaxosNode extends Node<PaxosMsg> {
 	def onRestart() {
 		var s = stable;
 		stable = PaxosStable.new();
-		if (config.persistAcceptor) {
+		if (!inject.forgetAcceptor) {
 			stable.promised = s.promised;
 			stable.acceptedBallot = s.acceptedBallot;
 			stable.acceptedValue = s.acceptedValue;
 		}
-		if (config.persistRound) stable.round = s.round;
+		if (!inject.forgetRound) stable.round = s.round;
 		reset();
 	}
 	private def reset() {
@@ -163,7 +164,7 @@ class PaxosNode extends Node<PaxosMsg> {
 				}
 				if (numPromises >= majority()) {
 					phase = Phase.ACCEPT;
-					var v = if(bestBallot > 0 && config.adoptAccepted, bestValue, proposal);
+					var v = if(bestBallot > 0 && !inject.ignorePromises, bestValue, proposal);
 					broadcast(PaxosMsg.Accept(ballot, v));
 				}
 			}

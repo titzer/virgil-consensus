@@ -36,5 +36,6 @@ if [ $TEST = 1 ]; then
 		echo "=== $p"
 		bin/$p scenarios
 		bin/$p fuzz -runs=10000
+		bin/$p selftest
 	done
 fi

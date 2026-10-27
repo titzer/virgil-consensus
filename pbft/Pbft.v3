@@ -149,8 +149,10 @@ class PbftObserver {
 	def onNewView(replica: int, view: int) { }
 }
 
-// Configuration knobs; the defaults are the correct protocol.
-class PbftConfig {
+// Fault injection, for testing that the checker catches protocol mistakes
+// (see "Fault injection" in README.md). Every flag is off by default, which
+// is the correct protocol.
+class PbftInjected {
 	var weakQuorum = false;		// use 2f instead of 2f+1 for commit and new-view quorums
 	var skipCertSigs = false;	// don't verify signatures inside view-change certificates
 	var trustNewView = false;	// don't recompute/validate the NewView's proposals
@@ -198,7 +200,7 @@ class PbftEntry(view: int, seq: int, n: int) {
 class PbftReplica extends Node<PbftMsg> {
 	def VIEWCHANGE = 0;	// the view-change timer kind
 	def f: int;
-	def config: PbftConfig;
+	def inject: PbftInjected;
 	def keys: KeyRing;
 	def signer: Signer;
 	def observer: PbftObserver;
@@ -227,14 +229,14 @@ class PbftReplica extends Node<PbftMsg> {
 	var backoff = 1;			// timer expiries to wait before escalating a view change
 	var waits = 0;
 
-	new(id: int, n: int, f, config, keys, signer, observer) super(id, n) { }
+	new(id: int, n: int, f, inject, keys, signer, observer) super(id, n) { }
 
 	def primary(v: int) -> int {
 		return v % n;
 	}
 	// Quorum for commits, new views, and commit certificates.
 	def quorum() -> int {
-		return if(config.weakQuorum, 2 * f, 2 * f + 1);
+		return if(inject.weakQuorum, 2 * f, 2 * f + 1);
 	}
 
 	// A client request arrives.
@@ -392,7 +394,7 @@ class PbftReplica extends Node<PbftMsg> {
 		waits = 0;
 		futurePPs.clear();
 		var certs = Vector<PbftCert>.new();
-		if (!config.omitPrepared) {
+		if (!inject.omitPrepared) {
 			for (s = 1; s <= maxCertSeq; s++) {
 				if (bestCert.has(s)) certs.put(bestCert[s]);
 			}
@@ -492,7 +494,7 @@ class PbftReplica extends Node<PbftMsg> {
 			var pp = pps[i];
 			if (pp.view != v || !keys.verifyBy(pp.sig, primary(v), PbftDigest.pp(v, pp.seq, pp.op))) return;
 		}
-		if (!config.trustNewView) {
+		if (!inject.trustNewView) {
 			var ops = computeO(nvcs);
 			if (ops.length != pps.length) return;
 			for (i < ops.length) if (pps[i].seq != i + 1 || pps[i].op != ops[i]) return;
@@ -535,7 +537,7 @@ class PbftReplica extends Node<PbftMsg> {
 		return true;
 	}
 	def validCert(c: PbftCert, newView: int) -> bool {
-		var pp = c.pp, sigs = !config.skipCertSigs;
+		var pp = c.pp, sigs = !inject.skipCertSigs;
 		if (pp.view >= newView || pp.seq < 1 || pp.op < 0) return false;
 		if (sigs && !validPP(pp)) return false;
 		var d = PbftDigest.op(pp.op), voters = Array<bool>.new(n), count = 0;
